@@ -1,4 +1,4 @@
-# installation-management-system
+# INSTALLATION MANAGEMENT SYSTEM
 Sistem management instalasi perangkat
 
 # Dashboard
