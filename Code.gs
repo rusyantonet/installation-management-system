@@ -5,6 +5,7 @@
  */
 
 const APP_TITLE = 'Dokumentasi Instalasi Unit';
+const REPORT_SUBTITLE = 'MineSafeDrive - PT. Freeport Indonesia';   // teks di bawah judul laporan PDF
 const PHOTO_FOLDER_NAME = 'Foto Instalasi Unit';
 const SESSION_SECONDS = 6 * 3600;      // login berlaku 6 jam (maks CacheService)
 const REQUIRE_PHOTO = false;           // ubah true jika foto wajib saat status Installed
@@ -147,12 +148,13 @@ const ROUTES = {
   formData:      { fn: () => formData_() },
   listInstalls:  { fn: () => listInstalls_() },
   getInstall:    { fn: p => getInstall_(p) },
-  saveInstall:   { fn: (p, u) => saveInstall_(p, u), w: true },
+  saveInstall:   { fn: (p, u) => saveInstall_(p, u), w: true , edit: true },
   deleteInstall: { fn: p => del_('Installations', p.id), w: true, admin: true },
-  uploadPhoto:   { fn: p => uploadPhoto_(p) },
-  replaceDevice: { fn: (p, u) => replaceDevice_(p, u), w: true },
+  uploadPhoto:   { fn: p => uploadPhoto_(p) , edit: true },
+  replaceDevice: { fn: (p, u) => replaceDevice_(p, u), w: true, edit: true },
   listReplacements: { fn: p => listReplacements_(p) },
   generateReport: { fn: (p, u) => generateReport_(p, u) },
+  generateExcel: { fn: (p, u) => generateExcel_(p, u) },
   listUnits:     { fn: () => rows_('Units').sort((a, b) => natural_(a.unitNo, b.unitNo)).map(unitOut_), admin: true },
   saveUnit:      { fn: p => saveUnit_(p), w: true, admin: true },
   deleteUnit:    { fn: p => deleteUnit_(p), w: true, admin: true },
@@ -174,6 +176,7 @@ function api(action, token, p) {
     const r = ROUTES[action];
     if (!r) throw new Error('Aksi tidak dikenal');
     if (r.admin && u.role !== 'Admin') throw new Error('Akses ditolak: khusus Admin.');
+    if (r.edit && u.role === 'Viewer') throw new Error('Akses ditolak: akun Viewer hanya bisa melihat data.');
     if (r.w) { lock = LockService.getScriptLock(); lock.waitLock(20000); }
     const d = r.fn(p, u);
     return { ok: true, data: d === undefined ? null : JSON.parse(JSON.stringify(d)) };
@@ -212,7 +215,7 @@ function saveDevice_(p) {
 function saveUser_(p, me) {
   const un = String(p.username || '').trim().toLowerCase();
   if (!un || !String(p.name || '').trim()) throw new Error('Username dan nama wajib diisi');
-  if (!['Admin', 'Engineer'].includes(p.role)) throw new Error('Role tidak valid');
+  if (!['Admin', 'Engineer', 'Viewer'].includes(p.role)) throw new Error('Role tidak valid');
   const all = rows_('Users');
   if (all.some(x => x.id !== p.id && String(x.username).toLowerCase() === un)) throw new Error('Username sudah dipakai');
   if (!p.id && !p.password) throw new Error('Password wajib diisi untuk user baru');
@@ -364,17 +367,19 @@ function tbl_(body, header, rows, widths) {
   const st = {};
   st[DocumentApp.Attribute.FONT_FAMILY] = 'Arial';
   st[DocumentApp.Attribute.FONT_SIZE] = 9;
+  st[DocumentApp.Attribute.BOLD] = false;
+  st[DocumentApp.Attribute.FOREGROUND_COLOR] = RC_.ink;
   st[DocumentApp.Attribute.BORDER_COLOR] = RC_.line;
   st[DocumentApp.Attribute.BORDER_WIDTH] = 0.5;
   t.setAttributes(st);
   widths.forEach((w, i) => t.setColumnWidth(i, w));
   if (data.length * header.length <= 120) {            // tabel kecil: set ukuran font per sel agar pasti
-    for (let r = 0; r < data.length; r++) for (let c = 0; c < header.length; c++) t.getCell(r, c).editAsText().setFontSize(9);
+    for (let r = 1; r < data.length; r++) for (let c = 0; c < header.length; c++) t.getCell(r, c).editAsText().setFontSize(9).setBold(false).setForegroundColor(RC_.ink);
   }
   for (let c = 0; c < header.length; c++) {
     const cell = t.getRow(0).getCell(c);
     cell.setBackgroundColor(RC_.head);
-    cell.editAsText().setForegroundColor('#ffffff').setBold(true);
+    cell.editAsText().setFontSize(9).setForegroundColor('#ffffff').setBold(true);
   }
   return t;
 }
@@ -411,41 +416,45 @@ function generateReport_(p, u) {
     repl = listReplacements_({}).filter(r => ids[r.unitId] && (isUnit || ((!from || r.date >= from) && (!to || r.date <= to))));
   }
 
-  const nowD = fmtD_(Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd')) + ' ' + Utilities.formatDate(new Date(), tz, 'HH:mm');
   const stamp = Utilities.formatDate(new Date(), tz, 'yyyyMMdd_HHmm');
   const label = isUnit ? String(ins[0].unitNo).replace(/[^\w\-]/g, '_') : 'Rekap';
   const name = 'Laporan_Instalasi_' + label + '_' + stamp + '.pdf';
-  const doc = DocumentApp.create('tmp ' + name);
+  const doc = DocumentApp.create(name.replace(/\.pdf$/, ''));
   const id = doc.getId();
   try {
     const body = doc.getBody();
     body.setPageWidth(595.28); body.setPageHeight(841.89);
     body.setMarginTop(40); body.setMarginBottom(40); body.setMarginLeft(36); body.setMarginRight(36);
-    // const fp = doc.addFooter().getParagraphs()[0];
-    // fp.setText('Dokumentasi Instalasi Unit \u00B7 dicetak ' + nowD + ' oleh ' + u.name);
-    // fp.editAsText().setFontSize(8).setForegroundColor(RC_.mut);
 
     const p0 = body.getChild(0).asParagraph();
     p0.setText('LAPORAN INSTALASI PERANGKAT');
     const t0 = p0.editAsText();
     t0.setFontFamily('Arial'); t0.setFontSize(20); t0.setBold(true); t0.setForegroundColor(RC_.head);
     p0.setSpacingAfter(2);
-    para_(body, 'MineSafeDrive ' + '-' + ' PT. Freeport Indonesia ', 12, false, RC_.amber, 2);
-    // para_(body, 'Dibuat: ' + nowD + ' \u00B7 oleh ' + u.name, 9, false, RC_.mut, 2);
+    para_(body, REPORT_SUBTITLE, 12, false, RC_.amber, 2);
     if (!isUnit) para_(body, 'Periode tanggal instalasi: ' + (from || to ? (from ? fmtD_(from) : 'awal') + ' s/d ' + (to ? fmtD_(to) : 'sekarang') : 'Semua periode'), 9, false, RC_.mut, 8);
 
     if (!isUnit) {
+      // Ringkasan dihitung dari seluruh unit aktif (sama dengan Dashboard)
       const active = allUnits.filter(x => bool_(x.active));
-      const has = {};
-      allIns.forEach(i => has[i.unitId] = 1);
-      const complete = ins.filter(i => i.pct === 100).length;
-      const avg = Math.round(ins.reduce((s, i) => s + i.pct, 0) / ins.length);
+      const activeIds = {};
+      active.forEach(x => activeIds[x.id] = 1);
+      const insAct = allIns.filter(i => activeIds[i.unitId]);
+      const complete = insAct.filter(i => i.pct === 100).length;
+      const pending = insAct.length - complete;
+      const notYet = active.length - insAct.length;
+      const overall = active.length ? Math.round(insAct.reduce((s, i) => s + i.pct, 0) / active.length) : 0;
+
       para_(body, 'Ringkasan', 13, true, RC_.head, 4, 8);
       tbl_(body, ['Ringkasan', 'Jumlah'], [
-        ['Unit dalam laporan', ins.length], ['Instalasi lengkap (100%)', complete],
-        ['Belum lengkap (ada device pending)', ins.length - complete], ['Rata-rata progress', avg + '%'],
-        ['Total unit aktif', active.length], ['Unit aktif yang belum ada data instalasi', active.filter(x => !has[x.id]).length]
-      ].map(r => [r[0], String(r[1])]), [330, 193]);
+        ['Progress keseluruhan', overall + '%'],
+        ['Jumlah unit aktif', String(active.length)],
+        ['Jumlah instalasi lengkap (100%)', String(complete)],
+        ['Jumlah instalasi pending (sebagian device pending)', String(pending)],
+        ['Jumlah belum diinstal', String(notYet)]
+      ], [330, 193]);
+      if (from || to) para_(body, 'Catatan: ringkasan mencakup seluruh unit aktif tanpa dibatasi periode. Tabel rekap per unit mengikuti periode di atas.', 8, false, RC_.mut, 4, 4);
+
       para_(body, 'Rekap per Unit', 13, true, RC_.head, 4, 10);
       tbl_(body, ['No', 'Unit', 'Tipe', 'Tanggal', 'Progress', 'Device Pending'],
         ins.map((i, k) => [String(k + 1), String(i.unitNo), typeOf[i.unitId] || '-', fmtD_(i.date),
@@ -456,19 +465,33 @@ function generateReport_(p, u) {
 
     if (detail) {
       ins.forEach((i, k) => {
-        if (photos && (k > 0 || !isUnit)) body.appendPageBreak();
-        para_(body, i.unitNo + (typeOf[i.unitId] ? ' \u00B7 ' + typeOf[i.unitId] : ''), 14, true, RC_.head, 2, photos ? 0 : 14);
-        para_(body, 'Tanggal instalasi: ' + fmtD_(i.date) + ' \u00B7 '  + ' Progress: ' + i.installed + '/' + i.total + ' (' + i.pct + '%)', 9, false, RC_.mut, 6);
+        // Rekap: setiap unit di lembaran baru. Laporan satu unit: tanpa page break di awal.
+        const brk = !isUnit || k > 0;
+        if (brk) body.appendPageBreak();
+
+        para_(body, String(i.unitNo) + (typeOf[i.unitId] ? ' \u00B7 ' + typeOf[i.unitId] : ''), 14, true, RC_.head, 2, brk ? 0 : 14);
+        para_(body, 'Tanggal instalasi: ' + fmtD_(i.date) + ' \u00B7 Progress: ' + i.installed + '/' + i.total + ' (' + i.pct + '%)', 9, false, RC_.mut, 8);
         const dt = tbl_(body, ['Device', 'Status', 'Serial Number'],
           i.details.map(d => [d.name, d.status, d.sn || '-']), [190, 90, 243]);
         i.details.forEach((d, r) => {
           if (d.status === 'Pending') dt.getCell(r + 1, 1).editAsText().setForegroundColor(RC_.pend).setBold(true);
         });
-        // if (i.remarks) para_(body, 'Remarks: ' + i.remarks, 9, false, RC_.ink, 4, 8);
 
+        // Riwayat penggantian: tepat di bawah detail instalasi
+        if (history) {
+          para_(body, 'Riwayat Penggantian', 11, true, RC_.head, 4, 10);
+          const hs = repl.filter(r => r.unitId === i.unitId);
+          if (!hs.length) para_(body, 'Tidak ada penggantian perangkat.', 9, false, RC_.mut, 4);
+          else tbl_(body, ['Tanggal', 'Device', 'SN Lama', 'SN Baru', 'Alasan'],
+            hs.map(r => [fmtD_(r.date), r.deviceName, r.oldSN || '-', r.newSN || '-',
+              r.reason + (r.note ? ' - ' + r.note : '') + ' (oleh ' + r.createdBy + ')']), [66, 104, 80, 80, 193]);
+        }
+
+        // Foto instalasi: selalu di lembaran baru
         const list = photos ? i.details.filter(d => d.photo) : [];
         if (list.length) {
-          para_(body, 'Foto Instalasi', 11, true, RC_.head, 4, 10);
+          body.appendPageBreak();
+          para_(body, 'Foto Instalasi', 11, true, RC_.head, 4, 0);
           const grid = [];
           for (let r = 0; r < Math.ceil(list.length / 2); r++) grid.push(['', '']);
           const gt = body.appendTable(grid);
@@ -484,14 +507,6 @@ function generateReport_(p, u) {
               img.setWidth(240).setHeight(Math.round(h * 240 / w));
             } catch (e) { cell.appendParagraph('(foto tidak tersedia)'); }
           });
-        }
-        if (history) {
-          para_(body, 'Riwayat Penggantian', 11, true, RC_.head, 4, 10);
-          const hs = repl.filter(r => r.unitId === i.unitId);
-          if (!hs.length) para_(body, 'Tidak ada penggantian perangkat.', 9, false, RC_.mut, 4);
-          else tbl_(body, ['Tanggal', 'Device', 'SN Lama', 'SN Baru', 'Alasan'],
-            hs.map(r => [fmtD_(r.date), r.deviceName, r.oldSN || '-', r.newSN || '-',
-              r.reason + (r.note ? ' - ' + r.note : '') + ' (oleh ' + r.createdBy + ')']), [66, 104, 80, 80, 193]);
         }
       });
     } else if (history) {
@@ -542,4 +557,87 @@ function dashboard_() {
     replTotal: rp.length,
     replByDevice: Object.keys(rc).map(n => ({ name: n, count: rc[n] })).sort((a, b) => b.count - a.count).slice(0, 5)
   };
+}
+
+/* ============ EXPORT EXCEL ============ */
+// Jalankan authorizeExcel() SEKALI dari editor untuk memberi izin Spreadsheet/Drive/UrlFetch.
+function authorizeExcel() {
+  const ss = SpreadsheetApp.create('tmp-authorize-xlsx');
+  const r = UrlFetchApp.fetch('https://docs.google.com/spreadsheets/d/' + ss.getId() + '/export?format=xlsx',
+    { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+  DriveApp.getFileById(ss.getId()).setTrashed(true);
+  Logger.log('Izin Excel OK (HTTP ' + r.getResponseCode() + ')');
+}
+const XLSX_SN_DEVICES = ['DMS Camera', 'ADAS Camera', 'INCAB Camera', 'GPIO Box', 'SIM Card'];
+
+function writeSheet_(sh, header, rows, widths) {
+  const n = header.length;
+  sh.getRange(1, 1, Math.max(rows.length + 1, 2), n).setNumberFormat('@');   // semua teks (SN tidak berubah format)
+  sh.getRange(1, 1, 1, n).setValues([header])
+    .setFontWeight('bold').setBackground('#e8a317').setFontColor('#1d2327').setVerticalAlignment('middle');
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, n).setValues(rows).setVerticalAlignment('top');
+    sh.getRange(1, 1, rows.length + 1, n).createFilter();
+  }
+  sh.setFrozenRows(1);
+  widths.forEach((w, i) => sh.setColumnWidth(i + 1, w));
+}
+
+function generateExcel_(p, u) {
+  const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  const re = /^\d{4}-\d{2}-\d{2}$/;
+  const from = re.test(p.from || '') ? p.from : '', to = re.test(p.to || '') ? p.to : '';
+  if (from && to && from > to) throw new Error('Tanggal awal tidak boleh setelah tanggal akhir');
+
+  const typeOf = {};
+  rows_('Units').forEach(x => typeOf[x.id] = x.type);
+  const ins = rows_('Installations').map(instOut_)
+    .filter(i => (!from || i.date >= from) && (!to || i.date <= to))
+    .sort((a, b) => natural_(a.unitNo, b.unitNo));
+  if (!ins.length) throw new Error('Tidak ada data instalasi pada rentang tanggal tersebut');
+
+  // Sheet 1: Detail Instalasi (satu baris per unit)
+  const head1 = ['No', 'Unit', 'Tipe', 'Tanggal'].concat(XLSX_SN_DEVICES.map(n => 'SN ' + n), ['Status Instalasi', 'Remarks']);
+  const rows1 = ins.map((i, k) => [String(k + 1), String(i.unitNo), typeOf[i.unitId] || '-', fmtD_(i.date)]
+    .concat(XLSX_SN_DEVICES.map(n => {
+      const d = i.details.find(x => x.name === n);
+      return !d ? '-' : (d.sn || (d.status === 'Pending' ? 'Pending' : '-'));
+    }))
+    .concat([i.pct === 100 ? 'Lengkap' : 'Pending', i.remarks || '']));
+
+  // Sheet 2: Riwayat Penggantian
+  const withHist = p.history !== false;
+  let rows2 = [];
+  if (withHist) {
+    const ids = {};
+    ins.forEach(i => ids[i.unitId] = 1);
+    rows2 = listReplacements_({})
+      .filter(r => ids[r.unitId] && (!from || r.date >= from) && (!to || r.date <= to))
+      .sort((a, b) => String(a.date).localeCompare(String(b.date)) || natural_(a.unitNo, b.unitNo))
+      .map((r, k) => [String(k + 1), fmtD_(r.date), String(r.unitNo), r.deviceName, r.oldSN || '-', r.newSN || '-',
+                      r.reason, r.createdBy, r.note || '']);
+  }
+
+  const stamp = Utilities.formatDate(new Date(), tz, 'yyyyMMdd_HHmm');
+  const name = 'Data_Instalasi_' + stamp + '.xlsx';
+  const ss = SpreadsheetApp.create(name.replace(/\.xlsx$/, ''));
+  const id = ss.getId();
+  try {
+    const s1 = ss.getSheets()[0];
+    s1.setName('Detail Instalasi');
+    writeSheet_(s1, head1, rows1, [40, 90, 110, 95, 140, 140, 140, 140, 140, 120, 240]);
+    if (withHist) {
+      const s2 = ss.insertSheet('Riwayat Penggantian');
+      writeSheet_(s2, ['No', 'Tanggal', 'Unit', 'Device', 'SN Lama', 'SN Baru', 'Alasan', 'Oleh', 'Catatan'],
+        rows2, [40, 95, 90, 140, 140, 140, 90, 120, 240]);
+    }
+    SpreadsheetApp.flush();
+    const res = UrlFetchApp.fetch('https://docs.google.com/spreadsheets/d/' + id + '/export?format=xlsx',
+      { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) throw new Error('Gagal membuat file Excel (HTTP ' + res.getResponseCode() + '). Pastikan authorizeExcel() sudah dijalankan.');
+    const bytes = res.getBlob().getBytes();
+    return { name: name, base64: Utilities.base64Encode(bytes), size: bytes.length, units: rows1.length, repl: rows2.length, withHist: withHist };
+  } finally {
+    try { DriveApp.getFileById(id).setTrashed(true); } catch (e) { /* abaikan */ }
+  }
 }
