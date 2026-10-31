@@ -1,23 +1,32 @@
 /**
- * DOKUMENTASI INSTALASI PERANGKAT KENDARAAN TAMBANG
+ * DOKUMENTASI INSTALASI PERANGKAT KENDARAAN TAMBANG (Multi-Project)
  * Google Apps Script (container-bound ke Google Sheet)
  * Langkah awal: jalankan fungsi setup() satu kali.
  */
 
 const APP_TITLE = 'Dokumentasi Instalasi Unit';
-const REPORT_SUBTITLE = 'MineSafeDrive - PT. Freeport Indonesia';   // teks di bawah judul laporan PDF
+const REPORT_SUBTITLE = 'MineSafeDrive - PT. Freeport Indonesia';   // cadangan jika nama project kosong
 const PHOTO_FOLDER_NAME = 'Foto Instalasi Unit';
 const SESSION_SECONDS = 6 * 3600;      // login berlaku 6 jam (maks CacheService)
 const REQUIRE_PHOTO = false;           // ubah true jika foto wajib saat status Installed
+const LOGIN_BG_FILE_ID = '1r2B5LsQ3-EK5wAN2YtKxLPWqhvCtNkfU';           // ID file Google Drive untuk background halaman login (file tidak perlu dibuat publik)
 
 const SHEETS = {
-  Users:         ['id', 'username', 'name', 'passHash', 'role', 'active', 'createdAt'],
-  Units:         ['id', 'unitNo', 'type', 'notes', 'active'],
-  Devices:       ['id', 'name', 'needSN', 'needPhoto', 'active', 'sort'],
-  Installations: ['id', 'unitId', 'unitNo', 'date', 'remarks', 'details', 'createdBy', 'createdAt', 'updatedAt'],
-  Replacements:  ['id', 'unitId', 'unitNo', 'deviceId', 'deviceName', 'date', 'oldSN', 'newSN', 'reason', 'note', 'photo', 'createdBy', 'createdAt']
+  Projects:      ['id', 'name', 'active', 'createdAt'],
+  Guide:         ['id', 'title', 'body', 'roles', 'public', 'active', 'sort', 'updatedAt', 'updatedBy'],
+  // Users:         ['id', 'username', 'name', 'passHash', 'role', 'active', 'createdAt'],
+  Users:         ['id', 'username', 'name', 'passHash', 'role', 'active', 'createdAt', 'projectIds'],
+  Units:         ['id', 'unitNo', 'type', 'notes', 'active', 'projectId'],
+  Devices:       ['id', 'name', 'needSN', 'needPhoto', 'active', 'sort', 'projectId'],
+  Installations: ['id', 'unitId', 'unitNo', 'date', 'remarks', 'details', 'createdBy', 'createdAt', 'updatedAt', 'projectId'],
+  Replacements:  ['id', 'unitId', 'unitNo', 'deviceId', 'deviceName', 'date', 'oldSN', 'newSN', 'reason', 'note', 'photo', 'createdBy', 'createdAt', 'projectId']
 };
+const SCOPED_ = ['Units', 'Devices', 'Installations', 'Replacements'];   // sheet yang dipisah per project
 const REASONS = ['Rusak', 'Hilang', 'Upgrade', 'Lainnya'];
+const ROLES = ['Admin', 'Manager', 'Engineer', 'Viewer'];
+function toIds_(v) { return (Array.isArray(v) ? v : String(v || '').split(',')).map(s => String(s).trim()).filter(Boolean); }
+function userProjects_(u) { return toIds_(u.projectIds); }
+function canAccessProject_(u, pid) { return u.role === 'Admin' || userProjects_(u).indexOf(pid) >= 0; }
 
 const DEFAULT_DEVICES = [
   ['DMS Camera', 1, 1], ['ADAS Camera', 1, 1], ['INCAB Camera', 1, 1], ['GPIO Box', 1, 1],
@@ -25,6 +34,9 @@ const DEFAULT_DEVICES = [
   ['GSM Antenna', 0, 0], ['Wifi Antenna', 0, 0], ['Bluetooth Antenna', 0, 0],
   ['Source Power', 0, 0], ['SIM Card', 1, 0], ['SSD', 0, 0]
 ];
+
+// Project aktif untuk request yang sedang berjalan (diisi di api())
+let CUR_PROJECT = '', CUR_PROJECT_NAME = '';
 
 /* ============ SETUP (jalankan sekali dari editor) ============ */
 function setup() {
@@ -43,9 +55,26 @@ function setup() {
     save_('Users', { username: 'admin', name: 'Administrator', passHash: hash_('admin123'),
                      role: 'Admin', active: true, createdAt: new Date().toISOString() });
   }
-  if (!rows_('Devices').length) {
-    DEFAULT_DEVICES.forEach((d, i) => save_('Devices', { name: d[0], needSN: !!d[1], needPhoto: !!d[2], active: true, sort: i + 1 }));
-  }
+
+  // Project default + migrasi data lama (baris tanpa projectId masuk ke project pertama)
+  if (!rows_('Projects').length) save_('Projects', { name: 'Project 1', active: true, createdAt: new Date().toISOString() });
+  const defId = rows_('Projects')[0].id;
+    // Migrasi: user non-Admin lama yang belum punya project diberi akses ke semua project yang ada (perilaku lama tetap jalan)
+  const allPid = rows_('Projects').map(x => x.id).join(',');
+  rows_('Users').forEach(u => {
+    if (u.role !== 'Admin' && !String(u.projectIds || '').trim()) save_('Users', { id: u.id, projectIds: allPid });
+  });
+  // END
+
+  SCOPED_.forEach(n => {
+    const sh = sheet_(n), col = SHEETS[n].indexOf('projectId') + 1, last = sh.getLastRow();
+    if (last < 2) return;
+    const rg = sh.getRange(2, col, last - 1, 1);
+    rg.setValues(rg.getValues().map(r => [r[0] === '' ? defId : r[0]]));
+  });
+  if (!rows_('Devices').length) seedDevices_(defId);   // project baru tanpa device: isi device standar
+
+  if (!rows_('Guide').length) seedGuide_();
   const ss0 = ss.getSheetByName('Sheet1') || ss.getSheetByName('Sheet 1');
   if (ss0 && ss.getSheets().length > 1) ss.deleteSheet(ss0);
   Logger.log('Setup selesai. Login awal: admin / admin123 (segera ganti password).');
@@ -100,11 +129,20 @@ function rows_(name) {
     return o;
   });
 }
+// Baca data khusus project yang sedang aktif
+function prows_(name) { return rows_(name).filter(r => r.projectId === CUR_PROJECT); }
+
 function save_(name, obj) {
   const sh = sheet_(name);
   const h = SHEETS[name];
   const toRow = o => h.map(k => (o[k] === undefined || o[k] === null) ? '' : String(o[k]));
   if (!obj.id) {
+    if (SCOPED_.includes(name)) {
+      if (!obj.projectId) {
+        if (!CUR_PROJECT) throw new Error('Project belum dipilih');
+        obj.projectId = CUR_PROJECT;
+      }
+    }
     obj.id = Utilities.getUuid();
     sh.getRange(sh.getLastRow() + 1, 1, 1, h.length).setNumberFormat('@').setValues([toRow(obj)]);
   } else {
@@ -118,6 +156,7 @@ function save_(name, obj) {
 function del_(name, id) {
   const ex = rows_(name).find(r => r.id === id);
   if (!ex) throw new Error('Data tidak ditemukan');
+  if (SCOPED_.includes(name) && ex.projectId !== CUR_PROJECT) throw new Error('Data bukan milik project ini');
   sheet_(name).deleteRow(ex._row);
 }
 function natural_(a, b) { return String(a).localeCompare(String(b), undefined, { numeric: true }); }
@@ -128,11 +167,18 @@ function login_(p) {
   const u = rows_('Users').find(x => String(x.username).toLowerCase() === un);
   if (!u || !bool_(u.active) || u.passHash !== hash_(String(p.password || '')))
     throw new Error('Username atau password salah, atau akun nonaktif.');
-  const token = Utilities.getUuid();
-  CacheService.getScriptCache().put('t_' + token, u.id, SESSION_SECONDS);
-  return { token: token, user: pubUser_(u) };
+  const pr = rows_('Projects').find(x => x.id === p.projectId);
+  if (!pr || !bool_(pr.active)) throw new Error('Pilih project yang valid.');
+  if (!canAccessProject_(u, pr.id)) throw new Error('Anda tidak memiliki akses ke project ini.');
+  const token = Utilities.getUuid(), cache = CacheService.getScriptCache();
+  cache.put('t_' + token, u.id, SESSION_SECONDS);
+  cache.put('p_' + token, pr.id, SESSION_SECONDS);
+  const user = pubUser_(u);
+  user.projectId = pr.id; user.projectName = pr.name;
+  return { token: token, user: user };
 }
-function pubUser_(u) { return { id: u.id, username: u.username, name: u.name, role: u.role, active: bool_(u.active) }; }
+// function pubUser_(u) { return { id: u.id, username: u.username, name: u.name, role: u.role, active: bool_(u.active) }; }
+function pubUser_(u) { return { id: u.id, username: u.username, name: u.name, role: u.role, active: bool_(u.active), projectIds: userProjects_(u) }; }
 function auth_(token) {
   const id = token && CacheService.getScriptCache().get('t_' + token);
   const u = id && rows_('Users').find(x => x.id === id);
@@ -141,41 +187,96 @@ function auth_(token) {
 }
 
 /* ============ ROUTER (satu pintu untuk semua aksi) ============ */
-// admin:true = hanya Admin | w:true = operasi tulis (dikunci agar tidak bentrok)
+// admin:true = hanya Admin | w:true = operasi tulis (dikunci) | edit:true = Viewer tidak boleh
+// const ROUTES = {
+//   me:            { fn: (p, u) => { const o = pubUser_(u); o.projectId = CUR_PROJECT; o.projectName = CUR_PROJECT_NAME; return o; } },
+//   dashboard:     { fn: () => dashboard_() },
+//   formData:      { fn: () => formData_() },
+//   listInstalls:  { fn: () => listInstalls_() },
+//   getInstall:    { fn: p => getInstall_(p) },
+//   saveInstall:   { fn: (p, u) => saveInstall_(p, u), w: true, edit: true },
+//   deleteInstall: { fn: p => del_('Installations', p.id), w: true, admin: true },
+//   uploadPhoto:   { fn: p => uploadPhoto_(p), edit: true },
+//   replaceDevice: { fn: (p, u) => replaceDevice_(p, u), w: true, edit: true },
+//   listReplacements: { fn: p => listReplacements_(p) },
+//   generateReport: { fn: (p, u) => generateReport_(p, u) },
+//   generateExcel: { fn: (p, u) => generateExcel_(p, u) },
+//   listProjects:  { fn: () => rows_('Projects').map(projectOut_), admin: true },
+//   saveProject:   { fn: p => saveProject_(p), w: true, admin: true },
+//   deleteProject: { fn: p => deleteProject_(p), w: true, admin: true },
+//   listUnits:     { fn: () => prows_('Units').sort((a, b) => natural_(a.unitNo, b.unitNo)).map(unitOut_), admin: true },
+//   saveUnit:      { fn: p => saveUnit_(p), w: true, admin: true },
+//   deleteUnit:    { fn: p => deleteUnit_(p), w: true, admin: true },
+//   listDevices:   { fn: () => prows_('Devices').sort((a, b) => a.sort - b.sort).map(deviceOut_), admin: true },
+//   saveDevice:    { fn: p => saveDevice_(p), w: true, admin: true },
+//   deleteDevice:  { fn: p => del_('Devices', p.id), w: true, admin: true },
+//   listUsers:     { fn: () => rows_('Users').map(pubUser_), admin: true },
+//   saveUser:      { fn: (p, u) => saveUser_(p, u), w: true, admin: true },
+//   deleteUser:    { fn: (p, u) => deleteUser_(p, u), w: true, admin: true }
+// };
+
+// admin:true = hanya Admin | mgr:true = Admin atau Manager | w:true = tulis (dikunci) | edit:true = Viewer tidak boleh
 const ROUTES = {
-  me:            { fn: (p, u) => pubUser_(u) },
+  me:            { fn: (p, u) => { const o = pubUser_(u); o.projectId = CUR_PROJECT; o.projectName = CUR_PROJECT_NAME; return o; } },
   dashboard:     { fn: () => dashboard_() },
   formData:      { fn: () => formData_() },
   listInstalls:  { fn: () => listInstalls_() },
   getInstall:    { fn: p => getInstall_(p) },
-  saveInstall:   { fn: (p, u) => saveInstall_(p, u), w: true , edit: true },
-  deleteInstall: { fn: p => del_('Installations', p.id), w: true, admin: true },
-  uploadPhoto:   { fn: p => uploadPhoto_(p) , edit: true },
+  saveInstall:   { fn: (p, u) => saveInstall_(p, u), w: true, edit: true },
+  deleteInstall: { fn: p => del_('Installations', p.id), w: true, mgr: true },
+  uploadPhoto:   { fn: p => uploadPhoto_(p), edit: true },
   replaceDevice: { fn: (p, u) => replaceDevice_(p, u), w: true, edit: true },
   listReplacements: { fn: p => listReplacements_(p) },
   generateReport: { fn: (p, u) => generateReport_(p, u) },
   generateExcel: { fn: (p, u) => generateExcel_(p, u) },
-  listUnits:     { fn: () => rows_('Units').sort((a, b) => natural_(a.unitNo, b.unitNo)).map(unitOut_), admin: true },
-  saveUnit:      { fn: p => saveUnit_(p), w: true, admin: true },
-  deleteUnit:    { fn: p => deleteUnit_(p), w: true, admin: true },
-  listDevices:   { fn: () => rows_('Devices').sort((a, b) => a.sort - b.sort).map(deviceOut_), admin: true },
-  saveDevice:    { fn: p => saveDevice_(p), w: true, admin: true },
-  deleteDevice:  { fn: p => del_('Devices', p.id), w: true, admin: true },
-  listUsers:     { fn: () => rows_('Users').map(pubUser_), admin: true },
-  saveUser:      { fn: (p, u) => saveUser_(p, u), w: true, admin: true },
-  deleteUser:    { fn: (p, u) => deleteUser_(p, u), w: true, admin: true }
+  listGuide:     { fn: (p, u) => listGuide_(u) },
+  saveGuide:     { fn: (p, u) => saveGuide_(p, u), w: true, admin: true },
+  deleteGuide:   { fn: p => deleteGuide_(p), w: true, admin: true },
+  // listProjects:  { fn: (p, u) => rows_('Projects').filter(x => canAccessProject_(u, x.id)).map(projectOut_), mgr: true },
+  listProjects:  { fn: () => rows_('Projects').map(projectOut_), admin: true },
+  assignableProjects: { fn: (p, u) => rows_('Projects').filter(x => canAccessProject_(u, x.id)).map(projectOut_), mgr: true },
+  // saveProject:   { fn: (p, u) => saveProject_(p, u), w: true, mgr: true },
+  saveProject:   { fn: p => saveProject_(p), w: true, admin: true },
+  deleteProject: { fn: p => deleteProject_(p), w: true, admin: true },
+  listUnits:     { fn: () => prows_('Units').sort((a, b) => natural_(a.unitNo, b.unitNo)).map(unitOut_), mgr: true },
+  saveUnit:      { fn: p => saveUnit_(p), w: true, mgr: true },
+  deleteUnit:    { fn: p => deleteUnit_(p), w: true, mgr: true },
+  listDevices:   { fn: () => prows_('Devices').sort((a, b) => a.sort - b.sort).map(deviceOut_), mgr: true },
+  saveDevice:    { fn: p => saveDevice_(p), w: true, mgr: true },
+  deleteDevice:  { fn: p => del_('Devices', p.id), w: true, mgr: true },
+  listUsers:     { fn: (p, u) => listUsers_(u), mgr: true },
+  saveUser:      { fn: (p, u) => saveUser_(p, u), w: true, mgr: true },
+  deleteUser:    { fn: (p, u) => deleteUser_(p, u), w: true, mgr: true }
 };
 
 function api(action, token, p) {
   let lock = null;
   try {
     p = p || {};
+    // Daftar project untuk dropdown di halaman login (tanpa token)
+    if (action === 'publicProjects')
+      return { ok: true, data: rows_('Projects').filter(x => bool_(x.active)).map(projectOut_) };
+    if (action === 'loginBg') return { ok: true, data: loginBg_() };   // gambar background login (hanya file yang ditentukan di LOGIN_BG_FILE_ID)
     if (action === 'login') return { ok: true, data: login_(p) };
-    if (action === 'logout') { CacheService.getScriptCache().remove('t_' + token); return { ok: true }; }
+    if (action === 'logout') {
+      const c = CacheService.getScriptCache();
+      c.remove('t_' + token); c.remove('p_' + token);
+      return { ok: true };
+    }
+    if (action === 'publicGuide') return { ok: true, data: publicGuide_() };
     const u = auth_(token);
+    const pid = CacheService.getScriptCache().get('p_' + token);
+    const pj = pid && rows_('Projects').find(x => x.id === pid);
+    // if (!pj) throw new Error('Sesi berakhir, silakan login kembali.');
+    // CUR_PROJECT = pj.id; CUR_PROJECT_NAME = pj.name;
+    if (!pj || !canAccessProject_(u, pj.id)) throw new Error('Sesi berakhir, silakan login kembali.');
+    CUR_PROJECT = pj.id; CUR_PROJECT_NAME = pj.name;
+
     const r = ROUTES[action];
     if (!r) throw new Error('Aksi tidak dikenal');
+    // if (r.admin && u.role !== 'Admin') throw new Error('Akses ditolak: khusus Admin.');
     if (r.admin && u.role !== 'Admin') throw new Error('Akses ditolak: khusus Admin.');
+    if (r.mgr && u.role !== 'Admin' && u.role !== 'Manager') throw new Error('Akses ditolak: khusus Admin / Manager.');
     if (r.edit && u.role === 'Viewer') throw new Error('Akses ditolak: akun Viewer hanya bisa melihat data.');
     if (r.w) { lock = LockService.getScriptLock(); lock.waitLock(20000); }
     const d = r.fn(p, u);
@@ -187,56 +288,305 @@ function api(action, token, p) {
   }
 }
 
+/* ============ BACKGROUND LOGIN ============ */
+function loginBg_() {
+  if (!LOGIN_BG_FILE_ID) return null;
+  const blob = DriveApp.getFileById(LOGIN_BG_FILE_ID).getBlob();
+  const bytes = blob.getBytes();
+  if (!/^image\//.test(blob.getContentType())) throw new Error('File background bukan gambar');
+  if (bytes.length > 2.5 * 1024 * 1024) throw new Error('Gambar background terlalu besar (' + Math.round(bytes.length / 1024) + ' KB). Perkecil hingga di bawah 2 MB.');
+  return 'data:' + blob.getContentType() + ';base64,' + Utilities.base64Encode(bytes);
+}
+
 /* ============ MASTER ============ */
+function projectOut_(x) { return { id: x.id, name: x.name, active: bool_(x.active) }; }
 function unitOut_(u) { return { id: u.id, unitNo: u.unitNo, type: u.type, notes: u.notes, active: bool_(u.active) }; }
 function deviceOut_(d) { return { id: d.id, name: d.name, needSN: bool_(d.needSN), needPhoto: bool_(d.needPhoto), active: bool_(d.active), sort: Number(d.sort) || 0 }; }
 
+function seedDevices_(pid) {
+  DEFAULT_DEVICES.forEach((d, i) => save_('Devices', { name: d[0], needSN: !!d[1], needPhoto: !!d[2], active: true, sort: i + 1, projectId: pid }));
+}
+function copyDevices_(fromId, toId) {
+  rows_('Devices').filter(d => d.projectId === fromId).sort((a, b) => Number(a.sort) - Number(b.sort)).forEach(d =>
+    save_('Devices', { name: d.name, needSN: bool_(d.needSN), needPhoto: bool_(d.needPhoto), active: bool_(d.active), sort: d.sort, projectId: toId }));
+}
+function saveProject_(p) {
+  const name = String(p.name || '').trim();
+  if (!name) throw new Error('Nama project wajib diisi');
+  const all = rows_('Projects');
+  if (all.some(x => x.id !== p.id && String(x.name).toLowerCase() === name.toLowerCase()))
+    throw new Error('Nama project sudah ada');
+  if (p.id && p.id === CUR_PROJECT && !p.active) throw new Error('Tidak bisa menonaktifkan project yang sedang dipakai');
+  const src = p.copyFrom || '__default';
+  if (!p.id && src !== '__default' && src !== '__empty' && !all.some(x => x.id === src)) throw new Error('Project sumber tidak ditemukan');
+  const o = { id: p.id, name: name, active: !!p.active };
+  if (!p.id) o.createdAt = new Date().toISOString();
+  const id = save_('Projects', o).id;
+  if (!p.id) {   // project baru: siapkan Master Device-nya sendiri
+    if (src === '__default') seedDevices_(id);
+    else if (src !== '__empty') copyDevices_(src, id);
+  }
+  return id;
+}
+function deleteProject_(p) {
+  if (p.id === CUR_PROJECT) throw new Error('Tidak bisa menghapus project yang sedang dipakai');
+  if (['Units', 'Installations', 'Replacements'].some(n => rows_(n).some(r => r.projectId === p.id)))
+    throw new Error('Project masih punya data unit/instalasi. Nonaktifkan saja, atau hapus datanya dulu.');
+  rows_('Devices').filter(d => d.projectId === p.id).sort((a, b) => b._row - a._row)
+    .forEach(d => sheet_('Devices').deleteRow(d._row));   // Master Device milik project ikut dihapus
+  del_('Projects', p.id);
+}
 function saveUnit_(p) {
   const no = String(p.unitNo || '').trim();
   if (!no) throw new Error('Nomor unit wajib diisi');
-  if (rows_('Units').some(x => x.id !== p.id && String(x.unitNo).toLowerCase() === no.toLowerCase()))
-    throw new Error('Nomor unit sudah ada');
+  if (prows_('Units').some(x => x.id !== p.id && String(x.unitNo).toLowerCase() === no.toLowerCase()))
+    throw new Error('Nomor unit sudah ada di project ini');
+  if (p.id && !prows_('Units').some(x => x.id === p.id)) throw new Error('Unit bukan milik project ini');
   return save_('Units', { id: p.id, unitNo: no, type: p.type || '', notes: p.notes || '', active: !!p.active }).id;
 }
 function deleteUnit_(p) {
-  if (rows_('Installations').some(i => i.unitId === p.id))
+  if (prows_('Installations').some(i => i.unitId === p.id))
     throw new Error('Unit sudah punya data instalasi. Nonaktifkan saja, atau hapus data instalasinya dulu.');
   del_('Units', p.id);
 }
 function saveDevice_(p) {
   const name = String(p.name || '').trim();
   if (!name) throw new Error('Nama device wajib diisi');
-  const all = rows_('Devices');
+  const all = prows_('Devices');
+  if (p.id && !all.some(x => x.id === p.id)) throw new Error('Device bukan milik project ini');
   if (all.some(x => x.id !== p.id && String(x.name).toLowerCase() === name.toLowerCase()))
-    throw new Error('Nama device sudah ada');
-  const sort = p.id ? undefined : (all.reduce((m, x) => Math.max(m, Number(x.sort) || 0), 0) + 1);
-  return save_('Devices', { id: p.id, name: name, needSN: !!p.needSN, needPhoto: !!p.needPhoto, active: !!p.active, sort: sort }).id;
+    throw new Error('Nama device sudah ada di project ini');
+  const o = { id: p.id, name: name, needSN: !!p.needSN, needPhoto: !!p.needPhoto, active: !!p.active };
+  if (!p.id) o.sort = all.reduce((m, x) => Math.max(m, Number(x.sort) || 0), 0) + 1;   // edit tidak menimpa urutan
+  return save_('Devices', o).id;
 }
+// function saveUser_(p, me) {
+//   const un = String(p.username || '').trim().toLowerCase();
+//   if (!un || !String(p.name || '').trim()) throw new Error('Username dan nama wajib diisi');
+//   if (!['Admin', 'Engineer', 'Viewer'].includes(p.role)) throw new Error('Role tidak valid');
+//   const all = rows_('Users');
+//   if (all.some(x => x.id !== p.id && String(x.username).toLowerCase() === un)) throw new Error('Username sudah dipakai');
+//   if (!p.id && !p.password) throw new Error('Password wajib diisi untuk user baru');
+//   if (p.password && String(p.password).length < 6) throw new Error('Password minimal 6 karakter');
+//   if (p.id === me.id && (!p.active || p.role !== 'Admin')) throw new Error('Anda tidak bisa menonaktifkan / menurunkan role akun sendiri');
+//   const o = { id: p.id, username: un, name: String(p.name).trim(), role: p.role, active: !!p.active };
+//   if (p.password) o.passHash = hash_(String(p.password));
+//   if (!p.id) o.createdAt = new Date().toISOString();
+//   return save_('Users', o).id;
+// }
+// function deleteUser_(p, me) {
+//   if (p.id === me.id) throw new Error('Anda tidak bisa menghapus akun sendiri');
+//   del_('Users', p.id);
+// }
+
+  function listUsers_(me) {
+  const names = {}; rows_('Projects').forEach(x => names[x.id] = x.name);
+  const adm = me.role === 'Admin', mine = userProjects_(me);
+  return rows_('Users')
+    .filter(x => adm || (x.role !== 'Admin' && userProjects_(x).indexOf(CUR_PROJECT) >= 0))
+    .map(x => {
+      const o = pubUser_(x);
+      if (!adm) o.projectIds = o.projectIds.filter(id => mine.indexOf(id) >= 0);
+      o.projects = o.projectIds.map(id => names[id]).filter(Boolean).join(', ');
+      return o;
+    });
+}
+
 function saveUser_(p, me) {
   const un = String(p.username || '').trim().toLowerCase();
   if (!un || !String(p.name || '').trim()) throw new Error('Username dan nama wajib diisi');
-  if (!['Admin', 'Engineer', 'Viewer'].includes(p.role)) throw new Error('Role tidak valid');
-  const all = rows_('Users');
+  if (!ROLES.includes(p.role)) throw new Error('Role tidak valid');
+  const adm = me.role === 'Admin', all = rows_('Users');
   if (all.some(x => x.id !== p.id && String(x.username).toLowerCase() === un)) throw new Error('Username sudah dipakai');
   if (!p.id && !p.password) throw new Error('Password wajib diisi untuk user baru');
   if (p.password && String(p.password).length < 6) throw new Error('Password minimal 6 karakter');
-  if (p.id === me.id && (!p.active || p.role !== 'Admin')) throw new Error('Anda tidak bisa menonaktifkan / menurunkan role akun sendiri');
-  const o = { id: p.id, username: un, name: String(p.name).trim(), role: p.role, active: !!p.active };
+  const ex = p.id ? all.find(x => x.id === p.id) : null;
+  if (p.id && !ex) throw new Error('Data tidak ditemukan');
+  const self = p.id === me.id;
+  if (self && (!p.active || p.role !== me.role)) throw new Error('Anda tidak bisa menonaktifkan / mengubah role akun sendiri');
+
+  let ids = [];
+  if (adm) {
+    const valid = {}; rows_('Projects').forEach(x => valid[x.id] = 1);
+    ids = toIds_(p.projectIds).filter(id => valid[id]);
+    if (p.role === 'Admin') ids = [];
+    else if (!ids.length) throw new Error('Pilih minimal satu project untuk role ' + p.role);
+  } else {
+    const mine = userProjects_(me);
+    if (!self && !['Engineer', 'Viewer'].includes(p.role)) throw new Error('Manager hanya dapat mengelola role Engineer dan Viewer.');
+    if (ex && !self) {
+      if (ex.role === 'Admin' || ex.role === 'Manager') throw new Error('Akses ditolak: akun ini hanya bisa diubah Admin.');
+      if (userProjects_(ex).indexOf(CUR_PROJECT) < 0) throw new Error('User bukan bagian dari project ini');
+    }
+    if (self) ids = userProjects_(me);
+    else {
+      const pick = toIds_(p.projectIds).filter(id => mine.indexOf(id) >= 0);
+      const keep = ex ? userProjects_(ex).filter(id => mine.indexOf(id) < 0) : [];   // akses ke project lain tidak disentuh
+      ids = keep.concat(pick.filter(id => keep.indexOf(id) < 0));
+      if (!ids.length) throw new Error('Pilih minimal satu project');
+    }
+  }
+  const o = { id: p.id, username: un, name: String(p.name).trim(), role: p.role, active: !!p.active, projectIds: ids.join(',') };
   if (p.password) o.passHash = hash_(String(p.password));
   if (!p.id) o.createdAt = new Date().toISOString();
   return save_('Users', o).id;
 }
+
 function deleteUser_(p, me) {
   if (p.id === me.id) throw new Error('Anda tidak bisa menghapus akun sendiri');
-  del_('Users', p.id);
+  const ex = rows_('Users').find(x => x.id === p.id);
+  if (!ex) throw new Error('Data tidak ditemukan');
+  if (me.role === 'Admin') return del_('Users', p.id);
+  if (ex.role === 'Admin' || ex.role === 'Manager') throw new Error('Akses ditolak: akun ini hanya bisa dihapus Admin.');
+  const ids = userProjects_(ex);
+  if (ids.indexOf(CUR_PROJECT) < 0) throw new Error('User bukan bagian dari project ini');
+  const left = ids.filter(x => x !== CUR_PROJECT);
+  if (!left.length) return del_('Users', p.id);                       // tidak punya project lain: akun dihapus
+  save_('Users', { id: ex.id, projectIds: left.join(',') });          // masih punya project lain: hanya dikeluarkan dari project ini
+}
+/* ============ PANDUAN (WIKI) ============ */
+const GUIDE_ROLES = ['Manager', 'Engineer', 'Viewer'];   // Admin selalu bisa membaca semua
+
+function guideOut_(g) {
+  return { id: g.id, title: g.title, body: g.body, roles: toIds_(g.roles), public: bool_(g.public),
+           active: bool_(g.active), sort: Number(g.sort) || 0, updatedAt: g.updatedAt, updatedBy: g.updatedBy };
+}
+function guideSort_(a, b) { return a.sort - b.sort || natural_(a.title, b.title); }
+
+function listGuide_(u) {
+  const adm = u.role === 'Admin';
+  return rows_('Guide').map(guideOut_)
+    .filter(g => adm || g.active)
+    .sort(guideSort_);
+}
+function publicGuide_() {   // tanpa login: semua artikel aktif
+  return rows_('Guide').map(guideOut_).filter(g => g.active).sort(guideSort_)
+    .map(g => ({ id: g.id, title: g.title, body: g.body }));
+}
+function saveGuide_(p, u) {
+  const title = String(p.title || '').trim(), body = String(p.body || '').trim();
+  if (!title) throw new Error('Judul wajib diisi');
+  if (title.length > 120) throw new Error('Judul maksimal 120 karakter');
+  if (!body) throw new Error('Isi panduan wajib diisi');
+  if (body.length > 40000) throw new Error('Isi terlalu panjang (maksimal 40.000 karakter). Pecah menjadi beberapa artikel.');
+  if (p.id && !rows_('Guide').some(x => x.id === p.id)) throw new Error('Artikel tidak ditemukan');
+  const o = { id: p.id, title: title, body: body,
+              roles: toIds_(p.roles).filter(r => GUIDE_ROLES.includes(r)).join(','),
+              public: !!p.public, active: !!p.active,
+              updatedAt: new Date().toISOString(), updatedBy: u.name };
+  const given = String(p.sort === undefined || p.sort === null ? '' : p.sort).trim() !== '' && !isNaN(Number(p.sort));
+  if (given) o.sort = Number(p.sort);
+  else if (!p.id) o.sort = rows_('Guide').reduce((m, x) => Math.max(m, Number(x.sort) || 0), 0) + 1;
+  return save_('Guide', o).id;
+}
+function deleteGuide_(p) { del_('Guide', p.id); }
+
+/* Isi awal panduan (dibuat otomatis oleh setup() jika sheet Guide masih kosong) */
+const GUIDE_SEED = [
+  ['Memulai: Login dan Memilih Project', 'Manager,Engineer,Viewer', true, [
+    '## Login',
+    '1. Buka tautan aplikasi, lalu isi **Username** dan **Password**.',
+    '2. Pilih **Project**. Anda hanya bisa masuk ke project yang sudah ditentukan Admin.',
+    '3. Klik **Masuk**.',
+    '## Catatan',
+    '- Sesi login berlaku sekitar 6 jam, setelah itu login ulang.',
+    '- Untuk pindah project, klik **Keluar**, lalu login kembali dan pilih project lain.',
+    '- Jika daftar project belum terisi, tunggu beberapa detik atau klik daftar untuk memuat ulang.',
+    '- Di ponsel, buka sidebar dengan tombol garis tiga di kiri atas.'
+  ]],
+  ['Pesan yang Sering Muncul', 'Manager,Engineer,Viewer', true, [
+    '- **Username atau password salah, atau akun nonaktif**: periksa ejaan, atau minta Admin memeriksa status akun.',
+    '- **Anda tidak memiliki akses ke project ini**: pilih project lain, atau minta Admin menambahkan akses.',
+    '- **Sesi berakhir**: login ulang. Sesi habis setelah sekitar 6 jam atau akses project dicabut.',
+    '- **Akun Viewer hanya bisa melihat data**: Viewer tidak boleh mengubah data.',
+    '- **Serial Number wajib diisi**: isi SN untuk device Installed yang membutuhkannya.',
+    '- **Pilih status untuk ...**: ada device yang belum dipilih statusnya.',
+    '- **Foto terlalu banyak**: pada laporan PDF, kurangi cakupan, matikan opsi foto, atau buat laporan per unit.'
+  ]],
+  ['Dashboard', 'Manager,Engineer,Viewer', false, [
+    'Dashboard menampilkan progres instalasi project aktif. Hanya **unit aktif** yang dihitung.',
+    '- **Progress keseluruhan**: rata-rata progres semua unit aktif. Unit yang belum diinstal dihitung 0%.',
+    '- **Instalasi lengkap**: unit dengan semua device Installed.',
+    '- **Sebagian pending**: unit sudah mulai diinstal tetapi masih ada device Pending.',
+    '- **Belum diinstal**: unit yang belum punya data instalasi.',
+    '- **Penggantian perangkat**: total kejadian penggantian di project.',
+    'Di bawahnya ada progres per device, lima device yang paling sering diganti, dan tabel progres tiap unit.'
+  ]],
+  ['Input Data Instalasi', 'Manager,Engineer', false, [
+    '## Mengisi data',
+    '1. Buka **Input Data Instalasi** dan pilih **Nomor Unit**.',
+    '2. Atur **Tanggal Instalasi**.',
+    '3. Untuk setiap device, pilih status **Installed** atau **Pending**.',
+    '4. Untuk device Installed, isi **Serial Number** dan ambil atau pilih **foto** jika diminta.',
+    '5. Isi **Remarks** bila perlu, lalu klik **Simpan Data Instalasi**.',
+    '## Aturan',
+    '- Semua device harus sudah dipilih statusnya.',
+    '- Tunggu tulisan Foto terunggah sebelum menyimpan.',
+    '- Satu unit hanya punya satu data. Memilih unit yang sudah ada akan memperbarui datanya.',
+    '## Saat SN diubah',
+    'Jika SN pada device yang sudah Installed diubah, sistem menanyakan pilihan berikut.',
+    '- **Koreksi salah ketik**: tidak masuk riwayat.',
+    '- **Penggantian perangkat**: isi alasan, tanggal, dan catatan. Kejadian tercatat di Riwayat Penggantian.'
+  ]],
+  ['Data Instalasi, Edit, dan Ganti Perangkat', 'Manager,Engineer,Viewer', false, [
+    'Menu **Data Instalasi** menampilkan kartu per unit. Gunakan kolom cari untuk mencari nomor unit, lalu klik **Detail**.',
+    '## Tombol di detail unit',
+    '- **Unduh PDF**: laporan unit ini. Tersedia untuk semua role.',
+    '- **Ganti Perangkat**: catat penggantian satu perangkat. Admin, Manager, Engineer.',
+    '- **Edit**: buka halaman Input dengan data unit terisi. Admin, Manager, Engineer.',
+    '- **Hapus**: hapus seluruh data instalasi unit. Hanya Admin dan Manager, tidak bisa dibatalkan.',
+    '## Ganti Perangkat',
+    '1. Pilih device. Hanya yang berstatus Installed yang bisa diganti.',
+    '2. Isi **Serial Number Baru** (tidak boleh sama dengan SN lama).',
+    '3. Atur tanggal, pilih alasan, isi catatan, dan unggah foto bila diminta.',
+    '4. Klik **Simpan Penggantian**.'
+  ]],
+  ['Riwayat Penggantian dan Export Report', 'Manager,Engineer,Viewer', false, [
+    '## Riwayat Penggantian',
+    'Daftar semua penggantian perangkat di project aktif. Bisa dicari dan difilter berdasarkan tanggal.',
+    '## Export PDF',
+    '- Pilih cakupan: **Semua unit (rekap)** atau **Satu unit**.',
+    '- Opsi: rentang tanggal, detail per unit, foto (maksimal 30 foto), dan riwayat penggantian.',
+    '- Pembuatan PDF memakan waktu sekitar 10 sampai 60 detik. Jangan tutup halaman.',
+    '- Ringkasan pada laporan rekap mencakup seluruh unit aktif, tidak dibatasi periode.',
+    '## Export Excel',
+    '- Sheet **Detail Instalasi**: satu baris per unit dengan kolom SN tiap device.',
+    '- Sheet **Riwayat Penggantian** (opsional).'
+  ]],
+  ['Master Unit, Master Device, dan User Management', 'Manager', false, [
+    '## Master Unit dan Master Device',
+    '- Nomor unit unik per project. Unit yang sudah punya data instalasi tidak bisa dihapus, nonaktifkan saja.',
+    '- Nama device unik per project. Atur apakah device butuh Serial Number dan foto.',
+    '- Perubahan pengaturan device berlaku untuk input berikutnya.',
+    '## User Management',
+    '- Anda hanya melihat akun yang punya akses ke project yang sedang dipilih.',
+    '- Anda dapat menambah dan mengedit akun **Engineer** dan **Viewer**, serta menentukan project mereka dari project milik Anda.',
+    '- Tombol **Keluarkan** mengeluarkan user dari project ini. Akun baru terhapus jika user tidak punya project lain.',
+    '- Akun Admin dan Manager lain hanya bisa diubah oleh Admin.'
+  ]],
+  ['Panduan Administrator', '', false, [
+    '## Pengelolaan',
+    '- **Master Project**: tambah, edit, atau hapus project. Project yang masih punya data tidak bisa dihapus, nonaktifkan saja.',
+    '- **User Management**: Anda melihat semua akun. Role selain Admin wajib punya minimal satu project.',
+    '- **Panduan**: artikel ini dikelola dari menu Panduan. Atur peran pembaca dan penanda tampil di halaman login.',
+    '## Perawatan sistem',
+    '- Jalankan `setup()` satu kali setelah pembaruan kode yang menambah sheet atau kolom.',
+    '- Jalankan `authorizeReport()` dan `authorizeExcel()` satu kali untuk izin laporan.',
+    '- Setelah mengubah kode, gunakan **Deploy, lalu New version**.',
+    '- Ganti password bawaan segera setelah instalasi pertama.'
+  ]]
+];
+function seedGuide_() {
+  GUIDE_SEED.forEach((a, i) => save_('Guide', { title: a[0], roles: a[1], public: a[2], active: true, sort: i + 1,
+    body: a[3].join('\n'), updatedAt: new Date().toISOString(), updatedBy: 'System' }));
 }
 
 /* ============ INSTALASI ============ */
 function formData_() {
   return {
-    units: rows_('Units').filter(u => bool_(u.active)).sort((a, b) => natural_(a.unitNo, b.unitNo)).map(unitOut_),
-    devices: rows_('Devices').filter(d => bool_(d.active)).sort((a, b) => a.sort - b.sort).map(deviceOut_),
-    doneUnitIds: rows_('Installations').map(i => i.unitId)
+    units: prows_('Units').filter(u => bool_(u.active)).sort((a, b) => natural_(a.unitNo, b.unitNo)).map(unitOut_),
+    devices: prows_('Devices').filter(d => bool_(d.active)).sort((a, b) => a.sort - b.sort).map(deviceOut_),
+    doneUnitIds: prows_('Installations').map(i => i.unitId)
   };
 }
 function instOut_(i) {
@@ -247,18 +597,18 @@ function instOut_(i) {
            createdBy: i.createdBy, updatedAt: i.updatedAt };
 }
 function listInstalls_() {
-  return rows_('Installations').map(instOut_).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  return prows_('Installations').map(instOut_).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 function getInstall_(p) {
-  const i = rows_('Installations').find(x => x.unitId === p.unitId);
+  const i = prows_('Installations').find(x => x.unitId === p.unitId);
   return i ? instOut_(i) : null;
 }
 function saveInstall_(p, u) {
-  const unit = rows_('Units').find(x => x.id === p.unitId);
+  const unit = prows_('Units').find(x => x.id === p.unitId);
   if (!unit) throw new Error('Pilih nomor unit terlebih dahulu');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(p.date || '')) throw new Error('Tanggal instalasi wajib diisi');
   const devs = {};
-  rows_('Devices').forEach(d => devs[d.id] = d);
+  prows_('Devices').forEach(d => devs[d.id] = d);
   const details = (p.details || []).map(x => {
     const d = devs[x.deviceId];
     if (!d) throw new Error('Device tidak ditemukan');
@@ -271,7 +621,7 @@ function saveInstall_(p, u) {
   });
   if (!details.length) throw new Error('Tidak ada device untuk disimpan');
   const now = new Date().toISOString();
-  const ex = rows_('Installations').find(i => i.unitId === p.unitId); // satu unit = satu data (upsert)
+  const ex = prows_('Installations').find(i => i.unitId === p.unitId); // satu unit = satu data (upsert)
   const obj = Object.assign(ex ? { id: ex.id } : { createdBy: u.name, createdAt: now }, {
     unitId: unit.id, unitNo: unit.unitNo, date: p.date, remarks: p.remarks || '',
     details: JSON.stringify(details), updatedAt: now
@@ -292,6 +642,7 @@ function saveInstall_(p, u) {
   }, u, now));
   return { id: saved.id };
 }
+
 /* ============ RIWAYAT PENGGANTIAN ============ */
 function addRepl_(unit, entry, o, u, now) {
   save_('Replacements', { unitId: unit.id, unitNo: unit.unitNo, deviceId: entry.deviceId, deviceName: entry.name,
@@ -299,15 +650,15 @@ function addRepl_(unit, entry, o, u, now) {
     photo: o.photo || '', createdBy: u.name, createdAt: now });
 }
 function listReplacements_(p) {
-  return rows_('Replacements').filter(r => !p.unitId || r.unitId === p.unitId).map(r => ({
+  return prows_('Replacements').filter(r => !p.unitId || r.unitId === p.unitId).map(r => ({
       id: r.id, unitId: r.unitId, unitNo: r.unitNo, deviceName: r.deviceName, date: r.date, oldSN: r.oldSN,
       newSN: r.newSN, reason: r.reason, note: r.note, photo: r.photo, createdBy: r.createdBy, createdAt: r.createdAt }))
     .sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 function replaceDevice_(p, u) {
-  const unit = rows_('Units').find(x => x.id === p.unitId);
+  const unit = prows_('Units').find(x => x.id === p.unitId);
   if (!unit) throw new Error('Unit tidak ditemukan');
-  const ins = rows_('Installations').find(i => i.unitId === p.unitId);
+  const ins = prows_('Installations').find(i => i.unitId === p.unitId);
   if (!ins) throw new Error('Unit belum punya data instalasi');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(p.date || '')) throw new Error('Tanggal penggantian wajib diisi');
   if (!REASONS.includes(p.reason)) throw new Error('Pilih alasan penggantian');
@@ -315,7 +666,7 @@ function replaceDevice_(p, u) {
   const e = details.find(x => x.deviceId === p.deviceId);
   if (!e) throw new Error('Device tidak ada pada unit ini');
   if (e.status !== 'Installed') throw new Error('Hanya device berstatus Installed yang bisa diganti');
-  const dev = rows_('Devices').find(d => d.id === p.deviceId);
+  const dev = prows_('Devices').find(d => d.id === p.deviceId);
   const needSN = dev ? bool_(dev.needSN) : !!e.sn;
   const newSN = String(p.newSN || '').trim();
   if (needSN) {
@@ -390,8 +741,8 @@ function generateReport_(p, u) {
   const from = re.test(p.from || '') ? p.from : '', to = re.test(p.to || '') ? p.to : '';
   if (from && to && from > to) throw new Error('Tanggal awal tidak boleh setelah tanggal akhir');
 
-  const allUnits = rows_('Units');
-  const allIns = rows_('Installations').map(instOut_);
+  const allUnits = prows_('Units');
+  const allIns = prows_('Installations').map(instOut_);
   let ins;
   if (isUnit) {
     ins = allIns.filter(i => i.unitId === p.unitId);
@@ -431,7 +782,7 @@ function generateReport_(p, u) {
     const t0 = p0.editAsText();
     t0.setFontFamily('Arial'); t0.setFontSize(20); t0.setBold(true); t0.setForegroundColor(RC_.head);
     p0.setSpacingAfter(2);
-    para_(body, REPORT_SUBTITLE, 12, false, RC_.amber, 2);
+    para_(body, CUR_PROJECT_NAME || REPORT_SUBTITLE, 12, false, RC_.amber, 2);   // subtitle = nama project
     if (!isUnit) para_(body, 'Periode tanggal instalasi: ' + (from || to ? (from ? fmtD_(from) : 'awal') + ' s/d ' + (to ? fmtD_(to) : 'sekarang') : 'Semua periode'), 9, false, RC_.mut, 8);
 
     if (!isUnit) {
@@ -528,11 +879,11 @@ function generateReport_(p, u) {
 
 /* ============ DASHBOARD ============ */
 function dashboard_() {
-  const units = rows_('Units').filter(u => bool_(u.active)).sort((a, b) => natural_(a.unitNo, b.unitNo));
+  const units = prows_('Units').filter(u => bool_(u.active)).sort((a, b) => natural_(a.unitNo, b.unitNo));
   const ids = {};
   units.forEach(u => ids[u.id] = 1);
   const byUnit = {};
-  rows_('Installations').filter(i => ids[i.unitId]).forEach(i => byUnit[i.unitId] = instOut_(i));
+  prows_('Installations').filter(i => ids[i.unitId]).forEach(i => byUnit[i.unitId] = instOut_(i));
 
   const list = units.map(u => {
     const b = byUnit[u.id];
@@ -540,11 +891,11 @@ function dashboard_() {
              total: b ? b.total : 0, pct: b ? b.pct : 0, started: !!b };
   });
   const dev = {};
-  rows_('Devices').filter(d => bool_(d.active)).sort((a, b) => a.sort - b.sort).forEach(d => dev[d.name] = 0);
+  prows_('Devices').filter(d => bool_(d.active)).sort((a, b) => a.sort - b.sort).forEach(d => dev[d.name] = 0);
   Object.keys(byUnit).forEach(k => byUnit[k].details.forEach(x => {
     if (x.status === 'Installed' && x.name in dev) dev[x.name]++;
   }));
-  const rp = rows_('Replacements'), rc = {};
+  const rp = prows_('Replacements'), rc = {};
   rp.forEach(r => rc[r.deviceName] = (rc[r.deviceName] || 0) + 1);
   const total = units.length;
   const complete = list.filter(x => x.started && x.pct === 100).length;
@@ -568,7 +919,6 @@ function authorizeExcel() {
   DriveApp.getFileById(ss.getId()).setTrashed(true);
   Logger.log('Izin Excel OK (HTTP ' + r.getResponseCode() + ')');
 }
-const XLSX_SN_DEVICES = ['DMS Camera', 'ADAS Camera', 'INCAB Camera', 'GPIO Box', 'SIM Card'];
 
 function writeSheet_(sh, header, rows, widths) {
   const n = header.length;
@@ -590,16 +940,23 @@ function generateExcel_(p, u) {
   if (from && to && from > to) throw new Error('Tanggal awal tidak boleh setelah tanggal akhir');
 
   const typeOf = {};
-  rows_('Units').forEach(x => typeOf[x.id] = x.type);
-  const ins = rows_('Installations').map(instOut_)
+  prows_('Units').forEach(x => typeOf[x.id] = x.type);
+  const ins = prows_('Installations').map(instOut_)
     .filter(i => (!from || i.date >= from) && (!to || i.date <= to))
     .sort((a, b) => natural_(a.unitNo, b.unitNo));
   if (!ins.length) throw new Error('Tidak ada data instalasi pada rentang tanggal tersebut');
 
+  // Kolom SN mengikuti device yang butuh SN di project ini (urut sesuai Master Device)
+  const snDevices = prows_('Devices').filter(d => bool_(d.needSN) && bool_(d.active))
+    .sort((a, b) => Number(a.sort) - Number(b.sort)).map(d => d.name);
+  ins.forEach(i => i.details.forEach(d => {          // device nonaktif / sudah tidak butuh SN tapi masih punya SN tersimpan
+    if (d.sn && snDevices.indexOf(d.name) < 0) snDevices.push(d.name);
+  }));
+
   // Sheet 1: Detail Instalasi (satu baris per unit)
-  const head1 = ['No', 'Unit', 'Tipe', 'Tanggal'].concat(XLSX_SN_DEVICES.map(n => 'SN ' + n), ['Status Instalasi', 'Remarks']);
+  const head1 = ['No', 'Unit', 'Tipe', 'Tanggal'].concat(snDevices.map(n => 'SN ' + n), ['Status Instalasi', 'Remarks']);
   const rows1 = ins.map((i, k) => [String(k + 1), String(i.unitNo), typeOf[i.unitId] || '-', fmtD_(i.date)]
-    .concat(XLSX_SN_DEVICES.map(n => {
+    .concat(snDevices.map(n => {
       const d = i.details.find(x => x.name === n);
       return !d ? '-' : (d.sn || (d.status === 'Pending' ? 'Pending' : '-'));
     }))
@@ -625,7 +982,7 @@ function generateExcel_(p, u) {
   try {
     const s1 = ss.getSheets()[0];
     s1.setName('Detail Instalasi');
-    writeSheet_(s1, head1, rows1, [40, 90, 110, 95, 140, 140, 140, 140, 140, 120, 240]);
+    writeSheet_(s1, head1, rows1, [40, 90, 110, 95].concat(snDevices.map(() => 140), [120, 240]));
     if (withHist) {
       const s2 = ss.insertSheet('Riwayat Penggantian');
       writeSheet_(s2, ['No', 'Tanggal', 'Unit', 'Device', 'SN Lama', 'SN Baru', 'Alasan', 'Oleh', 'Catatan'],
