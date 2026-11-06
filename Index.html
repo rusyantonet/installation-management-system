@@ -972,5 +972,195 @@ var LOGIN_BG_DARKEN = 0.55;   // 0 = tanpa lapisan gelap, 1 = hitam penuh
   };
 })();
 </script>
+<script>
+/* ===== PATCH IMPORT DATA (khusus Admin) ===== Hapus blok ini untuk membatalkan. */
+(function () {
+  if (typeof PAGES === 'undefined' || typeof MENU === 'undefined') return;
+
+  const ui = MENU.findIndex(m => m[0] === 'users');
+  MENU.splice(ui < 0 ? MENU.length : ui + 1, 0, ['import', 'Import Data', '\uD83D\uDCE5', 1]);
+
+  /* Manager tampil sebagai Admin di frontend (lihat patch Role): sembunyikan menu ini untuk Manager */
+  const _start = start;
+  start = function () {
+    _start();
+    if (S.user && S.user.realRole === 'Manager') {
+      const b = document.querySelector('#menu button[data-p="import"]');
+      if (b) b.remove();
+    }
+  };
+
+  function parseCsv(t) {
+    t = String(t).replace(/^\uFEFF/, '');
+    const first = t.split(/\r?\n/)[0] || '';
+    const cnt = c => first.split(c).length - 1;
+    const d = cnt(';') > cnt(',') ? ';' : (cnt('\t') > cnt(',') ? '\t' : ',');
+    const out = []; let row = [], cur = '', q = false;
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i];
+      if (q) {
+        if (c === '"') { if (t[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+        else cur += c;
+      } else if (c === '"') q = true;
+      else if (c === d) { row.push(cur); cur = ''; }
+      else if (c === '\n' || c === '\r') {
+        if (c === '\r' && t[i + 1] === '\n') i++;
+        row.push(cur); cur = ''; out.push(row); row = [];
+      } else cur += c;
+    }
+    if (cur !== '' || row.length) { row.push(cur); out.push(row); }
+    return out.filter(r => r.some(x => String(x).trim() !== ''));
+  }
+  const csvCell = x => { x = String(x == null ? '' : x); return /[";\n\r]/.test(x) ? '"' + x.replace(/"/g, '""') + '"' : x; };
+
+  PAGES.import = async () => {
+    const fd = await call('formData');
+    const devs = fd.devices;
+    if (!devs.length) { $('#main').innerHTML = '<div class="card empty">Master Device project ini belum diisi. Isi dulu di menu Master Device.</div>'; return; }
+    let type = 'install', rows = [], pre = [], checked = null, label = '', tplUrl = '';
+
+    $('#main').innerHTML =
+      '<div class="card"><h3 style="margin-bottom:8px">1. Jenis data dan template</h3>' +
+      '<label class="f">Jenis data<select class="inp" id="imt"><option value="install">Data Instalasi (satu baris per unit)</option><option value="repl">Riwayat Penggantian</option></select></label>' +
+      '<p class="note2" id="imh"></p><div id="imd"></div></div>' +
+      '<div class="card"><h3 style="margin-bottom:8px">2. Opsi</h3><div id="imo"></div></div>' +
+      '<div class="card"><h3 style="margin-bottom:8px">3. Pilih file CSV</h3>' +
+      '<input type="file" id="imf" accept=".csv,.txt,text/csv"><p class="note2" id="imi"></p>' +
+      '<div class="bar" style="margin:0"><button class="btn" id="imc" disabled>Periksa data (simulasi)</button><button class="btn pri" id="imr" disabled>Impor sekarang</button></div></div>' +
+      '<div id="imx"></div>';
+
+    const sync = () => {
+      $('#imc').disabled = !rows.length;
+      $('#imr').disabled = !(checked && checked.ok > 0 && !checked.aborted);
+    };
+    const reset = () => { rows = []; pre = []; checked = null; $('#imx').innerHTML = ''; $('#imi').textContent = ''; sync(); };
+
+    function drawType() {
+      let head;
+      if (type === 'install') {
+        head = ['Nomor Unit', 'Tipe', 'Catatan Unit', 'Tanggal', 'Remarks'];
+        devs.forEach(d => {
+          head.push(d.name + ' - Status');
+          if (d.needSN) head.push(d.name + ' - SN');
+          if (d.needPhoto) head.push(d.name + ' - Foto');
+        });
+        $('#imh').innerHTML = 'Satu baris per unit. <b>Status</b>: Installed atau Pending (kosong dianggap Pending). <b>Tanggal</b>: yyyy-mm-dd atau dd/mm/yyyy. Kolom <b>- SN</b> diisi untuk device yang butuh serial number. Kolom <b>- Foto</b> (opsional) berisi ID atau tautan file Google Drive.';
+        $('#imo').innerHTML =
+          '<label class="chk"><input type="checkbox" id="oc" checked>Buat unit baru otomatis jika nomor unit belum ada di Master Unit</label>' +
+          '<label class="f">Jika unit sudah punya data instalasi<select class="inp" id="oe"><option value="skip">Lewati (data lama tidak diubah)</option><option value="update">Perbarui (timpa dengan data import)</option></select></label>' +
+          '<label class="chk"><input type="checkbox" id="os">Izinkan serial number kosong untuk device Installed (data lama tanpa SN)</label>' +
+          '<p class="note2">Mode Perbarui menimpa data lama dan tidak ikut dibatalkan oleh tombol Batalkan. Unit tanpa SN harus dilengkapi saat diedit lewat aplikasi.</p>';
+      } else {
+        head = ['Nomor Unit', 'Device', 'Tanggal', 'SN Lama', 'SN Baru', 'Alasan', 'Catatan'];
+        $('#imh').innerHTML = 'Satu baris per kejadian penggantian. <b>Alasan</b>: Rusak, Hilang, Upgrade, atau Lainnya. Nama <b>Device</b> harus sama persis dengan Master Device. Unit harus sudah ada. Data yang sama persis dengan yang sudah tercatat akan dilewati.';
+        $('#imo').innerHTML = '<p class="note2" style="margin:0">Import riwayat hanya menambah catatan di Riwayat Penggantian. Serial number pada data instalasi unit tidak diubah.</p>';
+      }
+      if (tplUrl) URL.revokeObjectURL(tplUrl);
+      tplUrl = URL.createObjectURL(new Blob(['\uFEFF' + head.map(csvCell).join(';') + '\r\n'], { type: 'text/csv' }));
+      $('#imd').innerHTML = '<a class="btn" href="' + tplUrl + '" download="template_import_' + (type === 'install' ? 'instalasi' : 'penggantian') + '.csv">Unduh template (' + esc(S.user.projectName || 'project') + ')</a>';
+    }
+    drawType();
+    $('#imt').onchange = e => { type = e.target.value; $('#imf').value = ''; reset(); drawType(); };
+    $('#imo').addEventListener('change', () => { checked = null; $('#imx').innerHTML = ''; sync(); });
+
+    const opts = () => ({ createUnits: !!$('#oc') && $('#oc').checked, onExisting: $('#oe') ? $('#oe').value : 'skip', allowNoSN: !!$('#os') && $('#os').checked });
+
+    $('#imf').onchange = e => {
+      const f = e.target.files[0]; reset();
+      if (!f) return;
+      if (f.size > 5 * 1024 * 1024) return toast('File terlalu besar (maksimal 5 MB)', true);
+      const fr = new FileReader();
+      fr.onload = () => load(String(fr.result), f.name);
+      fr.onerror = () => toast('Gagal membaca file', true);
+      fr.readAsText(f, 'utf-8');
+    };
+    function load(text, name) {
+      const t = parseCsv(text), bad = m => { $('#imi').innerHTML = '<span style="color:var(--bad)">' + m + '</span>'; };
+      if (t.length < 2) return bad('File kosong atau hanya berisi header.');
+      if (t.length - 1 > 2000) return bad('Maksimal 2000 baris per file. Pecah file menjadi beberapa bagian.');
+      const headers = t[0].map(x => String(x).trim()), low = headers.map(x => x.toLowerCase());
+      const need = type === 'install' ? ['nomor unit', 'tanggal'] : ['nomor unit', 'device', 'tanggal', 'alasan'];
+      const miss = need.filter(x => low.indexOf(x) < 0);
+      if (miss.length) return bad('Kolom wajib tidak ditemukan: ' + esc(miss.join(', ')) + '. Gunakan template terbaru.');
+      if (type === 'install' && !devs.some(d => low.indexOf(String(d.name).toLowerCase() + ' - status') >= 0))
+        return bad('Tidak ada kolom status device yang cocok dengan Master Device project ini. Unduh template terbaru.');
+      rows = t.slice(1).map((r, i) => { const v = {}; headers.forEach((h, j) => { v[h] = r[j] == null ? '' : r[j]; }); return { n: i + 2, v: v }; });
+      pre = [];
+      if (type === 'install') {
+        const key = headers[low.indexOf('nomor unit')], seen = {};
+        rows = rows.filter(r => {
+          const k = String(r.v[key]).trim().toLowerCase();
+          if (!k) return true;
+          if (seen[k]) { pre.push({ n: r.n, msg: 'Unit ' + r.v[key] + ' muncul lebih dari sekali di file (baris pertama dipakai)' }); return false; }
+          seen[k] = 1; return true;
+        });
+      }
+      $('#imi').textContent = name + ': ' + (rows.length + pre.length) + ' baris data terbaca. Klik Periksa data untuk simulasi.';
+      sync();
+    }
+
+    async function run(mode) {
+      const o = opts();
+      const out = { total: 0, ok: 0, skipped: 0, errors: pre.slice(), warns: [], units: 0, installs: 0, updated: 0, repl: 0, newUnitIds: [], unknownCols: [] };
+      const lock = x => ['imc', 'imr', 'imf', 'imt'].forEach(id => { $('#' + id).disabled = x; });
+      lock(true);
+      try {
+        for (let i = 0; i < rows.length; i += 150) {
+          $('#imi').textContent = (mode === 'commit' ? 'Mengimpor' : 'Memeriksa') + ' baris ' + (i + 1) + '-' + Math.min(i + 150, rows.length) + ' dari ' + rows.length + '...';
+          const r = await call('importRun', { type: type, mode: mode, rows: rows.slice(i, i + 150), opts: o, label: label });
+          ['total', 'ok', 'skipped', 'units', 'installs', 'updated', 'repl'].forEach(k => { out[k] += r[k]; });
+          [].push.apply(out.errors, r.errors); [].push.apply(out.warns, r.warns); [].push.apply(out.newUnitIds, r.newUnitIds);
+          r.unknownCols.forEach(c => { if (out.unknownCols.indexOf(c) < 0) out.unknownCols.push(c); });
+        }
+      } catch (e) { fail(e); out.aborted = true; }
+      out.total += pre.length;
+      lock(false); $('#imi').textContent = '';
+      return out;
+    }
+
+    const stat = (v, l, c) => '<div class="card stat" style="margin:0"><b' + (c ? ' style="color:var(' + c + ')"' : '') + '>' + v + '</b><span>' + l + '</span></div>';
+    const tbl = arr => !arr.length ? '' :
+      '<div class="card tw" style="max-height:320px;overflow:auto;margin-top:10px"><table style="min-width:0"><thead><tr><th style="width:80px">Baris</th><th>Keterangan</th></tr></thead><tbody>' +
+      arr.slice(0, 200).map(x => '<tr><td>' + esc(x.n) + '</td><td>' + esc(x.msg) + '</td></tr>').join('') + '</tbody></table></div>' +
+      (arr.length > 200 ? '<p class="note2">Menampilkan 200 dari ' + arr.length + ' catatan.</p>' : '');
+
+    function show(out, done) {
+      const det = type === 'install'
+        ? 'Unit baru: <b>' + out.units + '</b> \u00B7 Instalasi baru: <b>' + out.installs + '</b> \u00B7 Diperbarui: <b>' + out.updated + '</b>'
+        : 'Penggantian baru: <b>' + out.repl + '</b>';
+      $('#imx').innerHTML = '<div class="card"><h3 style="margin-bottom:10px">' + (done ? 'Hasil impor' : 'Hasil pemeriksaan (belum ada data yang disimpan)') + '</h3>' +
+        '<div class="grid g4">' + stat(out.total, 'Baris diproses') + stat(out.ok, done ? 'Berhasil' : 'Valid', '--ok') + stat(out.skipped, 'Dilewati', '--pend') + stat(out.errors.length, 'Error', out.errors.length ? '--bad' : '') + '</div>' +
+        '<p style="margin:12px 0 0">' + det + '</p>' +
+        (out.aborted ? '<p class="note">Proses terhenti karena kesalahan. Sebagian data mungkin sudah masuk. Pakai Batalkan, atau ulangi dengan opsi Lewati (data yang sudah masuk tidak akan ganda).</p>' : '') +
+        (out.unknownCols.length ? '<p class="note">Kolom tidak dikenali dan diabaikan: ' + esc(out.unknownCols.join(', ')) + '</p>' : '') +
+        (out.errors.length ? '<h3 style="margin:14px 0 0;font-size:17px">Baris ditolak</h3>' + tbl(out.errors) : '') +
+        (out.warns.length ? '<details style="margin-top:12px"><summary style="cursor:pointer;font-weight:600">Catatan (' + out.warns.length + ')</summary>' + tbl(out.warns) + '</details>' : '') +
+        (done && label ? '<p class="note2" style="margin-top:14px">Penanda batch: <b>' + esc(label) + '</b> (tampil pada kolom oleh di data instalasi).</p>' +
+          (out.ok > 0 ? '<button class="btn dng" id="imu">Batalkan import ini</button><p class="note2">Menghapus instalasi, penggantian, dan unit baru hasil import ini. Hanya tersedia selama halaman ini belum ditutup.</p>' : '') : '') +
+        '</div>';
+      const u = $('#imu');
+      if (u) u.onclick = async () => {
+        if (!(await confirmBox('Batalkan import ' + label + '? Data hasil import ini akan dihapus.'))) return;
+        try {
+          const r = await call('importUndo', { label: label, unitIds: out.newUnitIds });
+          $('#imx').innerHTML = '<div class="card">Import dibatalkan. Dihapus: ' + r.installs + ' instalasi, ' + r.repl + ' penggantian, ' + r.units + ' unit.</div>';
+        } catch (x) { fail(x); }
+      };
+    }
+
+    $('#imc').onclick = async () => { label = ''; checked = await run('check'); show(checked, false); sync(); };
+    $('#imr').onclick = async () => {
+      if (!checked || !checked.ok) return;
+      const msg = 'Impor ' + checked.ok + ' baris valid ke project "' + (S.user.projectName || '') + '"? ' + (checked.errors.length ? checked.errors.length + ' baris error akan dilewati. ' : '') + 'Pastikan Google Sheet sudah di-backup.';
+      if (!(await confirmBox(msg))) return;
+      label = 'Import ' + todayStr() + ' ' + new Date().toTimeString().slice(0, 8);
+      const out = await run('commit');
+      rows = []; pre = []; checked = null; $('#imf').value = '';
+      show(out, true); sync();
+    };
+    sync();
+  };
+})();
+</script>
 </body>
 </html>
