@@ -1,6 +1,6 @@
 # Flowchart Installation Management System (IMS)
 
-Diagram di bawah ditulis dengan Mermaid dan dirender langsung oleh GitHub. Warna: kuning = keputusan, merah = penolakan, abu-abu = langkah biasa.
+Diagram di bawah ditulis dengan Mermaid. Warna: kuning = keputusan, merah = penolakan, abu-abu = langkah biasa.
 
 ## 1. Alur login dan akses menu
 
