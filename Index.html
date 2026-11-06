@@ -770,6 +770,40 @@ var LOGIN_BG_DARKEN = 0.55;   // 0 = tanpa lapisan gelap, 1 = hitam penuh
 
   /* Menu baru */
   MENU.push(['guide', 'Panduan', '\uD83D\uDCD6']);
+    /* Panduan tidak tampil di sidebar; dibuka lewat ikon Customer Service di dekat akun.
+     Entri MENU di atas tetap diperlukan agar go('guide') dikenali. */
+  const st2 = document.createElement('style');
+  st2.textContent =
+    '.merow{display:flex;gap:8px;align-items:center;margin-top:8px}' +
+    '.me .merow button{margin-top:0}' +
+    '#helpbtn{display:flex;align-items:center;justify-content:center;width:36px;height:36px;padding:0}' +
+    '#helpbtn:hover{background:#2e373d}' +
+    '#helpbtn.on{background:var(--amber);border-color:var(--amber);color:#1d2327}';
+  document.head.appendChild(st2);
+
+  const meBox = document.querySelector('#side .me'), loBtn = document.getElementById('lo');
+  let hb = null;
+  if (meBox && loBtn) {
+    const row = document.createElement('div'); row.className = 'merow';
+    meBox.insertBefore(row, loBtn); row.appendChild(loBtn);   // tombol Keluar dipindah ke baris ini, fungsinya tetap
+    hb = document.createElement('button');
+    hb.type = 'button'; hb.id = 'helpbtn'; hb.title = 'Panduan'; hb.setAttribute('aria-label', 'Buka Panduan');
+    hb.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="2.5" y="13" width="4" height="6" rx="1.5"/><rect x="17.5" y="13" width="4" height="6" rx="1.5"/><path d="M19.5 19c0 1.7-1.8 3-4.5 3h-2"/></svg>';
+    hb.onclick = () => go('guide');
+    row.appendChild(hb);
+  }
+
+  /* Hapus tombol Panduan dari daftar menu setiap kali menu dirender */
+  const _start0 = start;
+  start = function () {
+    _start0();
+    const b = document.querySelector('#menu button[data-p="guide"]');
+    if (b) b.remove();
+  };
+
+  /* Sorot ikon saat halaman Panduan sedang terbuka */
+  const _go0 = go;
+  go = function (id) { const r = _go0(id); if (hb) hb.classList.toggle('on', id === 'guide'); return r; };
 
   /* Tombol bantuan di halaman login */
   const lf = document.getElementById('lf');
