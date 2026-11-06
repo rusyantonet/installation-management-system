@@ -9,7 +9,7 @@ const REPORT_SUBTITLE = 'MineSafeDrive - PT. Freeport Indonesia';   // cadangan 
 const PHOTO_FOLDER_NAME = 'Foto Instalasi Unit';
 const SESSION_SECONDS = 6 * 3600;      // login berlaku 6 jam (maks CacheService)
 const REQUIRE_PHOTO = false;           // ubah true jika foto wajib saat status Installed
-const LOGIN_BG_FILE_ID = '1r2B5LsQ3-EK5wAN2YtKxLPWqhvCtNkfU';           // ID file Google Drive untuk background halaman login (file tidak perlu dibuat publik)
+const LOGIN_BG_FILE_ID = '1h_2Hwr4Y_2geqMbzJes1UwxFL7URFyJm';           // ID file Google Drive untuk background halaman login (file tidak perlu dibuat publik)
 
 const SHEETS = {
   Projects:      ['id', 'name', 'active', 'createdAt'],
@@ -144,7 +144,12 @@ function save_(name, obj) {
       }
     }
     obj.id = Utilities.getUuid();
-    sh.getRange(sh.getLastRow() + 1, 1, 1, h.length).setNumberFormat('@').setValues([toRow(obj)]);
+  //   sh.getRange(sh.getLastRow() + 1, 1, 1, h.length).setNumberFormat('@').setValues([toRow(obj)]);
+  // } else {
+    obj.id = Utilities.getUuid();
+    const nr = sh.getLastRow() + 1;
+    if (nr > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), 1);
+    sh.getRange(nr, 1, 1, h.length).setNumberFormat('@').setValues([toRow(obj)]);
   } else {
     const ex = rows_(name).find(r => r.id === obj.id);
     if (!ex) throw new Error('Data tidak ditemukan');
@@ -232,6 +237,8 @@ const ROUTES = {
   listGuide:     { fn: (p, u) => listGuide_(u) },
   saveGuide:     { fn: (p, u) => saveGuide_(p, u), w: true, admin: true },
   deleteGuide:   { fn: p => deleteGuide_(p), w: true, admin: true },
+  importRun:     { fn: p => importRun_(p), w: true, admin: true },
+  importUndo:    { fn: p => importUndo_(p), w: true, admin: true },
   // listProjects:  { fn: (p, u) => rows_('Projects').filter(x => canAccessProject_(u, x.id)).map(projectOut_), mgr: true },
   listProjects:  { fn: () => rows_('Projects').map(projectOut_), admin: true },
   assignableProjects: { fn: (p, u) => rows_('Projects').filter(x => canAccessProject_(u, x.id)).map(projectOut_), mgr: true },
@@ -998,3 +1005,210 @@ function generateExcel_(p, u) {
     try { DriveApp.getFileById(id).setTrashed(true); } catch (e) { /* abaikan */ }
   }
 }
+/* ============ IMPORT DATA (khusus Admin) ============ */
+function rowArr_(name, o) { return SHEETS[name].map(k => (o[k] === undefined || o[k] === null) ? '' : String(o[k])); }
+
+// Tulis banyak baris sekaligus; menambah baris sheet jika kurang
+function appendRows_(name, objs) {
+  if (!objs.length) return;
+  const sh = sheet_(name), h = SHEETS[name];
+  const start = sh.getLastRow() + 1, need = start + objs.length - 1;
+  if (need > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), need - sh.getMaxRows());
+  sh.getRange(start, 1, objs.length, h.length).setNumberFormat('@').setValues(objs.map(o => rowArr_(name, o)));
+}
+// Hapus baris (dari bawah ke atas, dikelompokkan per rentang berurutan)
+function deleteRows_(name, list) {
+  if (!list.length) return 0;
+  const sh = sheet_(name), rows = list.map(r => r._row).sort((a, b) => b - a);
+  let i = 0;
+  while (i < rows.length) {
+    let j = i;
+    while (j + 1 < rows.length && rows[j + 1] === rows[j] - 1) j++;
+    sh.deleteRows(rows[j], j - i + 1);
+    i = j + 1;
+  }
+  return rows.length;
+}
+
+function impNorm_(v) {
+  const m = {};
+  Object.keys(v || {}).forEach(k => m[String(k).trim().toLowerCase()] = String(v[k] == null ? '' : v[k]).trim());
+  return m;
+}
+function impPick_(m, keys) { for (let i = 0; i < keys.length; i++) if (m[keys[i]] !== undefined) return m[keys[i]]; return ''; }
+function impDate_(s) {   // yyyy-mm-dd, atau dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy (hari lebih dulu)
+  s = String(s || '').trim();
+  let y, mo, d, m;
+  if ((m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s))) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+  else if ((m = /^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})/.exec(s))) { d = +m[1]; mo = +m[2]; y = +m[3]; }
+  else return '';
+  const t = new Date(y, mo - 1, d);
+  if (t.getFullYear() !== y || t.getMonth() !== mo - 1 || t.getDate() !== d) return '';
+  return y + '-' + ('0' + mo).slice(-2) + '-' + ('0' + d).slice(-2);
+}
+function impStatus_(s) {   // '' = kosong, null = tidak dikenali
+  const x = String(s || '').trim().toLowerCase();
+  if (!x) return '';
+  if (['installed', 'terpasang', 'terinstal', 'terinstall', 'sudah', 'ya', 'yes', 'y', '1', 'ok', 'true'].includes(x)) return 'Installed';
+  if (['pending', 'belum', 'tidak', 'no', 'n', '0', 'false', '-'].includes(x)) return 'Pending';
+  return null;
+}
+function impPhotoId_(s) {   // ID file Drive atau tautan Drive; null = tidak valid
+  s = String(s || '').trim();
+  if (!s) return '';
+  const m = /\/d\/([\w-]{20,})/.exec(s) || /[?&]id=([\w-]{20,})/.exec(s);
+  return m ? m[1] : (/^[\w-]{20,}$/.test(s) ? s : null);
+}
+
+// p: { type:'install'|'repl', mode:'check'|'commit', rows:[{n,v}], opts:{createUnits,onExisting,allowNoSN}, label }
+function importRun_(p) {
+  const commit = p.mode === 'commit';
+  const rows = Array.isArray(p.rows) ? p.rows : [];
+  if (!rows.length) throw new Error('Tidak ada baris untuk diproses');
+  if (rows.length > 300) throw new Error('Maksimal 300 baris per permintaan');
+  const label = String(p.label || '');
+  if (commit && !/^Import \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(label)) throw new Error('Label import tidak valid');
+  const res = { total: rows.length, ok: 0, skipped: 0, errors: [], warns: [], units: 0, installs: 0, updated: 0, repl: 0, newUnitIds: [], unknownCols: [] };
+  const ctx = { rows: rows, o: p.opts || {}, res: res, commit: commit, label: label, now: new Date().toISOString(),
+    devs: prows_('Devices'), unitBy: {},
+    err: (n, msg) => res.errors.push({ n: n, msg: msg }),
+    warn: (n, msg) => res.warns.push({ n: n, msg: msg }) };
+  prows_('Units').forEach(x => ctx.unitBy[String(x.unitNo).trim().toLowerCase()] = x);
+  return p.type === 'repl' ? impRepl_(ctx) : impInstall_(ctx);
+}
+
+function impInstall_(ctx) {
+  const rows = ctx.rows, res = ctx.res, o = ctx.o, err = ctx.err, warn = ctx.warn, unitBy = ctx.unitBy;
+  const devs = ctx.devs.filter(d => bool_(d.active)).sort((a, b) => Number(a.sort) - Number(b.sort));
+  if (!devs.length) throw new Error('Master Device project ini kosong atau tidak ada yang aktif');
+  const insBy = {};
+  prows_('Installations').forEach(i => insBy[i.unitId] = i);
+  const known = { 'nomor unit': 1, 'unit': 1, 'tipe': 1, 'catatan unit': 1, 'tanggal': 1, 'remarks': 1 };
+  devs.forEach(d => { const k = String(d.name).trim().toLowerCase(); known[k + ' - status'] = 1; known[k + ' - sn'] = 1; known[k + ' - foto'] = 1; });
+
+  const seen = {}, newUnits = [], newIns = [], upd = [];
+  rows.forEach((r, idx) => {
+    const m = impNorm_(r.v), n = r.n;
+    if (idx === 0) Object.keys(m).forEach(k => { if (k && !known[k]) res.unknownCols.push(k); });
+    const unitNo = impPick_(m, ['nomor unit', 'unit']);
+    if (!unitNo) return err(n, 'Nomor unit kosong');
+    const uk = unitNo.toLowerCase();
+    if (seen[uk]) return err(n, 'Unit ' + unitNo + ' muncul lebih dari sekali pada data ini');
+    seen[uk] = 1;
+    const date = impDate_(impPick_(m, ['tanggal']));
+    if (!date) return err(n, 'Tanggal tidak valid untuk unit ' + unitNo + ' (gunakan yyyy-mm-dd atau dd/mm/yyyy)');
+    let unit = unitBy[uk];
+    if (!unit && !o.createUnits) return err(n, 'Unit ' + unitNo + ' belum ada di Master Unit');
+    const ex = unit ? insBy[unit.id] : null;
+    if (ex && o.onExisting !== 'update') { res.skipped++; return warn(n, 'Unit ' + unitNo + ' sudah punya data instalasi, dilewati'); }
+
+    const before = res.errors.length, emptyDev = [], oldD = ex ? JSON.parse(ex.details || '[]') : [];
+    const details = devs.map(d => {
+      const k = String(d.name).trim().toLowerCase();
+      const raw = impPick_(m, [k + ' - status']);
+      let st = impStatus_(raw);
+      if (st === null) { err(n, 'Status ' + d.name + ' tidak dikenali: "' + raw + '" (unit ' + unitNo + ')'); st = 'Pending'; }
+      else if (st === '') { st = 'Pending'; emptyDev.push(d.name); }
+      let sn = bool_(d.needSN) ? impPick_(m, [k + ' - sn']) : '';
+      if (st === 'Installed' && bool_(d.needSN) && !sn && !o.allowNoSN) err(n, 'Serial Number ' + d.name + ' wajib diisi (unit ' + unitNo + ')');
+      if (st === 'Pending' && sn) { warn(n, 'SN ' + d.name + ' diabaikan karena status Pending'); sn = ''; }
+      let photo = '';
+      if (bool_(d.needPhoto)) {
+        photo = impPhotoId_(impPick_(m, [k + ' - foto']));
+        if (photo === null) { photo = ''; warn(n, 'Foto ' + d.name + ' tidak valid, diabaikan'); }
+        if (!photo && ex) { const od = oldD.find(x => x.deviceId === d.id); if (od && od.photo) photo = od.photo; }
+      }
+      return { deviceId: d.id, name: d.name, status: st, sn: sn, photo: photo };
+    });
+    if (res.errors.length > before) return;
+    if (emptyDev.length) warn(n, 'Unit ' + unitNo + ': status kosong dianggap Pending (' + emptyDev.join(', ') + ')');
+    res.ok++;
+
+    if (!unit) {
+      unit = { id: Utilities.getUuid(), unitNo: unitNo, type: impPick_(m, ['tipe']), notes: impPick_(m, ['catatan unit']), active: true, projectId: CUR_PROJECT };
+      unitBy[uk] = unit;
+      newUnits.push(unit); res.units++; res.newUnitIds.push(unit.id);
+    }
+    const base = { unitId: unit.id, unitNo: unit.unitNo, date: date, remarks: impPick_(m, ['remarks']), details: JSON.stringify(details), updatedAt: ctx.now };
+    if (ex) { upd.push({ ex: ex, obj: Object.assign({}, ex, base) }); res.updated++; }
+    else { newIns.push(Object.assign({ id: Utilities.getUuid(), createdBy: ctx.label || 'Import', createdAt: ctx.now, projectId: CUR_PROJECT }, base)); res.installs++; }
+  });
+
+  if (ctx.commit) {
+    appendRows_('Units', newUnits);
+    appendRows_('Installations', newIns);
+    const sh = sheet_('Installations'), h = SHEETS.Installations;
+    upd.forEach(x => sh.getRange(x.ex._row, 1, 1, h.length).setNumberFormat('@').setValues([rowArr_('Installations', x.obj)]));
+    SpreadsheetApp.flush();
+  }
+  return res;
+}
+
+function impRepl_(ctx) {
+  const rows = ctx.rows, res = ctx.res, err = ctx.err, warn = ctx.warn;
+  const devBy = {}; ctx.devs.forEach(d => devBy[String(d.name).trim().toLowerCase()] = d);
+  const reasonBy = {}; REASONS.forEach(x => reasonBy[x.toLowerCase()] = x);
+  const key = r => [r.unitId, r.deviceId, r.date, String(r.oldSN || '').trim(), String(r.newSN || '').trim()].join('|');
+  const have = {}; prows_('Replacements').forEach(r => have[key(r)] = 1);
+  const known = { 'nomor unit': 1, 'unit': 1, 'device': 1, 'tanggal': 1, 'sn lama': 1, 'sn baru': 1, 'alasan': 1, 'catatan': 1 };
+  const add = [];
+  rows.forEach((r, idx) => {
+    const m = impNorm_(r.v), n = r.n;
+    if (idx === 0) Object.keys(m).forEach(k => { if (k && !known[k]) res.unknownCols.push(k); });
+    const unitNo = impPick_(m, ['nomor unit', 'unit']);
+    if (!unitNo) return err(n, 'Nomor unit kosong');
+    const unit = ctx.unitBy[unitNo.toLowerCase()];
+    if (!unit) return err(n, 'Unit ' + unitNo + ' belum ada di Master Unit (impor data instalasi atau unit dulu)');
+    const dname = impPick_(m, ['device']);
+    const dev = devBy[dname.toLowerCase()];
+    if (!dev) return err(n, 'Device "' + dname + '" tidak ada di Master Device');
+    const date = impDate_(impPick_(m, ['tanggal']));
+    if (!date) return err(n, 'Tanggal tidak valid (unit ' + unitNo + ')');
+    const reason = reasonBy[impPick_(m, ['alasan']).toLowerCase()];
+    if (!reason) return err(n, 'Alasan harus salah satu dari: ' + REASONS.join(', '));
+    const oldSN = impPick_(m, ['sn lama']), newSN = impPick_(m, ['sn baru']);
+    if (!oldSN && !newSN) return err(n, 'SN lama dan SN baru sama-sama kosong');
+    const rec = { unitId: unit.id, unitNo: unit.unitNo, deviceId: dev.id, deviceName: dev.name, date: date, oldSN: oldSN, newSN: newSN,
+                  reason: reason, note: impPick_(m, ['catatan']), photo: '', createdBy: ctx.label || 'Import', createdAt: ctx.now, projectId: CUR_PROJECT };
+    const k = key(rec);
+    if (have[k]) { res.skipped++; return warn(n, 'Sudah tercatat (duplikat), dilewati'); }
+    have[k] = 1;
+    add.push(Object.assign({ id: Utilities.getUuid() }, rec));
+    res.ok++; res.repl++;
+  });
+  if (ctx.commit) { appendRows_('Replacements', add); SpreadsheetApp.flush(); }
+  return res;
+}
+
+// Batalkan satu batch import: hapus instalasi, penggantian, dan unit baru (yang belum punya instalasi) dengan label tsb
+function importUndo_(p) {
+  const label = String(p.label || '');
+  if (!/^Import \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(label)) throw new Error('Label import tidak valid');
+  const mine = r => r.projectId === CUR_PROJECT && r.createdBy === label;
+  const out = { installs: deleteRows_('Installations', prows_('Installations').filter(mine)),
+                repl: deleteRows_('Replacements', prows_('Replacements').filter(mine)), units: 0 };
+  const ids = toIds_(p.unitIds), has = {};
+  prows_('Installations').forEach(i => has[i.unitId] = 1);
+  out.units = deleteRows_('Units', prows_('Units').filter(x => ids.indexOf(x.id) >= 0 && !has[x.id]));
+  return out;
+}
+
+// function fixAdminLogin() {
+//   const NEW_PASSWORD = 'GANTI_DENGAN_PASSWORD_BARU';
+//   const props = PropertiesService.getScriptProperties();
+//   if (!props.getProperty('SALT')) props.setProperty('SALT', Utilities.getUuid());
+
+//   const users = rows_('Users');
+//   Logger.log('Jumlah user: ' + users.length + ' | ' +
+//     users.map(x => x.username + '(' + x.role + ',' + x.active + ')').join(', '));
+
+//   const u = users.find(x => String(x.username).trim().toLowerCase() === 'admin')
+//          || users.find(x => x.role === 'Admin');
+//   if (!u) throw new Error('Tidak ada user Admin di sheet Users');
+
+//   save_('Users', { id: u.id, passHash: hash_(NEW_PASSWORD), role: 'Admin', active: true });
+
+//   const c = rows_('Users').find(x => x.id === u.id);
+//   Logger.log('User: ' + c.username + ' | role=' + c.role + ' | active=' + c.active +
+//     ' | panjang hash=' + String(c.passHash).length + ' | cocok=' + (c.passHash === hash_(NEW_PASSWORD)));
+// }
