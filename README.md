@@ -306,10 +306,6 @@ Detail dan rencana migrasi (misalnya ke Firestore) tersedia di dokumentasi devel
 3. Uji dengan checklist manual di atas, termasuk akses antar role.
 4. Ajukan pull request dengan deskripsi perubahan, bagian kode yang terpengaruh, dan cara mengujinya.
 
-## Lisensi
-
-Belum ditentukan. Tambahkan file `LICENSE` sebelum repositori dipublikasikan.
-
 ## Kredit
 
 Developed by Rusyanto.
