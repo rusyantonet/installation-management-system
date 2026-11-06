@@ -52,6 +52,8 @@ Dibangun di atas **Google Sheets + Google Apps Script + Google Drive**, tanpa se
 
 ## Arsitektur
 
+Lihat [FLOWCHART.md](FLOWCHART.md) untuk diagram alur.
+
 ```
 Browser (Index.html)
    |  google.script.run.api(action, token, params)
